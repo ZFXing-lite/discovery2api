@@ -1,0 +1,22 @@
+# secrets / state — never commit
+config.yaml
+config.*.yaml
+!config.example.yaml
+state.json*
+*.usage
+*.tmp
+auths/
+keys/
+*.key
+*.pem
+
+# build artifacts
+/discovery2api
+/bin/
+/dist/
+*.exe
+
+# editors / os
+.idea/
+.vscode/
+.DS_Store

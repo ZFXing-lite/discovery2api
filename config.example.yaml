@@ -1,0 +1,71 @@
+# discovery2api configuration. Copy to config.yaml and fill in your API keys.
+# Docs: https://discovery.intern-ai.org.cn/token-plan/home
+# Upstream base URL is fixed for all three interfaces.
+
+host: ""          # bind address; "" = all interfaces, "127.0.0.1" = local only
+port: 8319
+
+tls:
+  enable: false
+  cert: ""
+  key: ""
+
+# Keys clients use to call THIS gateway (downstream auth). Leave the list
+# empty for an open gateway, then add real keys from the panel.
+api-keys: []
+
+# The Intern Discovery API endpoint. Keys are rotated by the pool below.
+upstream:
+  base-url: "https://discovery-api.intern-ai.org.cn"
+  default-model: "auto"
+  # The Discovery platform supports multiple models; set force-model to false
+  # so the client's model choice is forwarded as-is. Set true to override all
+  # requests with default-model.
+  force-model: false
+  timeout: 10m
+  connect-timeout: 15s
+  # One or more API keys from discovery.intern-ai.org.cn. Leave empty and add
+  # them from the panel, or set DISCOVERY2API_KEYS=key1,key2.
+  # Weight drives the weighted round-robin pick.
+  keys: []
+    # - key: "your-key-here"
+    #   weight: 1
+    #   proxy: ""            # optional per-key override: a socks5:// URL, or "none"
+
+# SOCKS5 egress pool. Leave the list empty for a direct connection.
+proxy:
+  policy: "round-robin"   # round-robin | random | sticky-key
+  health-every: 30s
+  fail-cooldown: 30s
+  socks5: []
+    # - url: "socks5://user:pass@1.2.3.4:1080"
+
+# Rate-limit handling, retries and cooldowns.
+# Note: all API keys under one account share the same RPM/TPM limits.
+rate-limit:
+  respect-header: true      # parse x-rpm-* / Retry-After
+  min-rpm-reserve: 1        # skip a key with fewer remaining requests than this
+  cooldown-429: 60s         # used when the upstream sends no Retry-After
+  cooldown-5xx: 30s
+  err-threshold: 3          # consecutive errors before a key is cooled down
+  err-cooldown: 10m
+  disable-on-401: true      # a 401 means the key is invalid or revoked
+  max-retries: 3            # cross-key retries per request
+  retry-on: [429, 500, 502, 503, 504]
+  backoff: 1s               # base retry backoff (exponential, +/-25% jitter)
+
+log:
+  level: "info"             # debug | info | warn | error
+  format: "text"            # text | json
+
+# Usage counters + pool state persistence (atomic tmp+rename writes).
+metrics:
+  enabled: true
+  state-file: "state/state.json"
+  flush-every: 5s
+
+# Management panel (/v0/management/panel). The password is the only value
+# required before the process will start.
+remote-management:
+  allow-remote: true
+  secret-key: ""

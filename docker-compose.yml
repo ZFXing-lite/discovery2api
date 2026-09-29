@@ -1,0 +1,24 @@
+services:
+  discovery2api:
+    build: .
+    image: discovery2api:latest
+    container_name: discovery2api
+    restart: unless-stopped
+    ports:
+      - "8319:8319"
+    environment:
+      # 部署时唯一必填项。没设密码进程会拒绝启动。
+      DISCOVERY2API_MGMT_KEY: ${DISCOVERY2API_MGMT_KEY:?set DISCOVERY2API_MGMT_KEY to the panel password}
+    volumes:
+      # 没有这个文件时，程序会用示例配置自动生成。必须可写，面板会回写它。
+      - ./config.yaml:/app/config.yaml
+      # 用量和 key 冷却状态，和配置文件分开，避免卷盖住 /app。
+      - discovery2api-state:/app/state
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8319/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  discovery2api-state:
