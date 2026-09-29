@@ -18,8 +18,17 @@ type Recorder struct {
 	mu     sync.Mutex
 	keys   map[string]*KeyUsage
 	models map[string]*ModelUsage
+	daily  map[string]*DailyUsage // date string "2006-01-02" → totals
 	path   string
 	dirty  atomic.Bool
+}
+
+// DailyUsage holds aggregate counters for one calendar day.
+type DailyUsage struct {
+	Requests         int64 `json:"requests"`
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	Errors           int64 `json:"errors"`
 }
 
 // KeyUsage holds counters for one upstream key.
@@ -39,7 +48,7 @@ type ModelUsage struct {
 }
 
 func New(path string) *Recorder {
-	return &Recorder{keys: map[string]*KeyUsage{}, models: map[string]*ModelUsage{}, path: path}
+	return &Recorder{keys: map[string]*KeyUsage{}, models: map[string]*ModelUsage{}, daily: map[string]*DailyUsage{}, path: path}
 }
 
 func (r *Recorder) getOrCreate(id string) *KeyUsage {
@@ -55,11 +64,12 @@ func (r *Recorder) getOrCreate(id string) *KeyUsage {
 func (r *Recorder) Record(keyID, model string, prompt, completion int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := time.Now().UTC()
 	k := r.getOrCreate(keyID)
 	k.Requests++
 	k.PromptTokens += int64(prompt)
 	k.CompletionTokens += int64(completion)
-	k.LastUsed = time.Now().UTC()
+	k.LastUsed = now
 	m, ok := r.models[model]
 	if !ok {
 		m = &ModelUsage{}
@@ -68,6 +78,16 @@ func (r *Recorder) Record(keyID, model string, prompt, completion int) {
 	m.Requests++
 	m.PromptTokens += int64(prompt)
 	m.CompletionTokens += int64(completion)
+	// Daily tracking.
+	date := now.Format("2006-01-02")
+	d, ok := r.daily[date]
+	if !ok {
+		d = &DailyUsage{}
+		r.daily[date] = d
+	}
+	d.Requests++
+	d.PromptTokens += int64(prompt)
+	d.CompletionTokens += int64(completion)
 	r.dirty.Store(true)
 }
 
@@ -76,6 +96,13 @@ func (r *Recorder) RecordError(keyID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.getOrCreate(keyID).Errors++
+	date := time.Now().UTC().Format("2006-01-02")
+	d, ok := r.daily[date]
+	if !ok {
+		d = &DailyUsage{}
+		r.daily[date] = d
+	}
+	d.Errors++
 	r.dirty.Store(true)
 }
 
@@ -93,7 +120,39 @@ func (r *Recorder) Snapshot() map[string]any {
 		cp := *v
 		models[m] = &cp
 	}
-	return map[string]any{"keys": keys, "models": models}
+	daily := make(map[string]*DailyUsage, len(r.daily))
+	for d, v := range r.daily {
+		cp := *v
+		daily[d] = &cp
+	}
+	// Compute today + total token summaries.
+	today := time.Now().UTC().Format("2006-01-02")
+	var todayIn, todayOut, todayReq, totalIn, totalOut, totalReq int64
+	for _, k := range r.keys {
+		totalIn += k.PromptTokens
+		totalOut += k.CompletionTokens
+		totalReq += k.Requests
+	}
+	if d, ok := r.daily[today]; ok {
+		todayIn = d.PromptTokens
+		todayOut = d.CompletionTokens
+		todayReq = d.Requests
+	}
+	return map[string]any{
+		"keys":   keys,
+		"models": models,
+		"daily":  daily,
+		"summary": map[string]any{
+			"today_prompt_tokens":     todayIn,
+			"today_completion_tokens": todayOut,
+			"today_total_tokens":      todayIn + todayOut,
+			"today_requests":          todayReq,
+			"total_prompt_tokens":     totalIn,
+			"total_completion_tokens": totalOut,
+			"total_tokens":            totalIn + totalOut,
+			"total_requests":          totalReq,
+		},
+	}
 }
 
 // Persist writes the snapshot atomically.
@@ -131,6 +190,7 @@ func (r *Recorder) Restore() error {
 	var doc struct {
 		Keys   map[string]*KeyUsage   `json:"keys"`
 		Models map[string]*ModelUsage `json:"models"`
+		Daily  map[string]*DailyUsage `json:"daily"`
 	}
 	if err := json.Unmarshal(b, &doc); err != nil {
 		return err
@@ -142,6 +202,9 @@ func (r *Recorder) Restore() error {
 	}
 	for m, v := range doc.Models {
 		r.models[m] = v
+	}
+	for d, v := range doc.Daily {
+		r.daily[d] = v
 	}
 	return nil
 }

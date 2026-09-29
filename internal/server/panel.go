@@ -664,6 +664,20 @@ var panelHTML = `<!DOCTYPE html>
           <tbody id="creditsBody"></tbody>
         </table>
       </div>
+      <div class="sec-head" style="margin-top:20px"><h2>Token 统计</h2><span class="sec-sub">今日与累计用量</span></div>
+      <p class="hint">统计网关转发的所有请求的 Token 用量。今日已用 = 当天 UTC 日期的累计；总已用 = 网关启动或状态文件创建以来的累计。1墨点 ≈ 20,000,000 tokens。</p>
+      <div class="hero-stats" id="tokenStatsHero">
+        <div class="hero-stat"><span class="hs-k">今日已用</span><span class="hs-v" id="tsTodayTokens">—</span></div>
+        <div class="hero-stat"><span class="hs-k">总已用</span><span class="hs-v" id="tsTotalTokens">—</span></div>
+        <div class="hero-stat"><span class="hs-k">今日请求</span><span class="hs-v" id="tsTodayReq">—</span></div>
+        <div class="hero-stat"><span class="hs-k">总请求</span><span class="hs-v" id="tsTotalReq">—</span></div>
+      </div>
+      <div class="stat-grid" style="margin-top:10px">
+        <div class="stat-cell"><div class="sc-k">今日输入</div><div class="sc-v" id="tsTodayIn">—</div></div>
+        <div class="stat-cell"><div class="sc-k">今日输出</div><div class="sc-v" id="tsTodayOut">—</div></div>
+        <div class="stat-cell"><div class="sc-k">总输入</div><div class="sc-v" id="tsTotalIn">—</div></div>
+        <div class="stat-cell"><div class="sc-k">总输出</div><div class="sc-v" id="tsTotalOut">—</div></div>
+      </div>
     </section>
   </div>
 
@@ -1123,6 +1137,7 @@ function refresh() {
     if (doSlow) renderAPIKeys(all[2]);
     if (doSlow) renderProxies(all[4]);
     renderUsage(all[3]);
+    renderTokenStats(all[3]);
     if (doSlow) renderSettings(all[5]);
     var dot = document.getElementById('healthDot');
     var cls = 'dot' + (all[0].keys_healthy > 0 ? '' : ' off');
@@ -1252,6 +1267,17 @@ function refreshCredits() {
       if (lbl) lbl.textContent = '';
       toast('墨点检测失败：' + e, true);
     });
+}
+function renderTokenStats(usage) {
+  var sm = (usage && usage.summary) || {};
+  hs('tsTodayTokens', fmtTokens(sm.today_total_tokens || 0));
+  hs('tsTotalTokens', fmtTokens(sm.total_tokens || 0));
+  hs('tsTodayReq', sm.today_requests || 0);
+  hs('tsTotalReq', sm.total_requests || 0);
+  hs('tsTodayIn', fmtTokens(sm.today_prompt_tokens || 0));
+  hs('tsTodayOut', fmtTokens(sm.today_completion_tokens || 0));
+  hs('tsTotalIn', fmtTokens(sm.total_prompt_tokens || 0));
+  hs('tsTotalOut', fmtTokens(sm.total_completion_tokens || 0));
 }
 function keysBatchAct(action) {
   var boxes = document.querySelectorAll('.key-chk:checked');
