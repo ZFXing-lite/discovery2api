@@ -444,7 +444,10 @@ func maskProxy(u string) string {
 		return "***"
 	}
 	if pu.User != nil {
-		pu.User = url.UserPassword("***", "***")
+		// Strip credentials and replace with a readable placeholder.
+		// Using url.UserPassword would URL-encode the asterisks.
+		pu.User = nil
+		return strings.Replace(pu.String(), "://", "://***@", 1)
 	}
 	return pu.String()
 }
