@@ -443,6 +443,9 @@ var panelHTML = `<!DOCTYPE html>
     <div class="nav-item" data-target="upstream-keys" onclick="navTo('upstream-keys')">
       <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="8" cy="15" r="4"/><path d="M10.85 12.15L19 4"/><path d="M18 6l2 2"/><path d="M15 4l2 2"/></svg></span> 账号管理
     </div>
+    <div class="nav-item" data-target="stats-credits" onclick="navTo('stats-credits')">
+      <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 4-6"/></svg></span> 统计
+    </div>
     <div class="nav-item" data-target="downstream-keys" onclick="navTo('downstream-keys')">
       <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-2 2l-2 2m-2 2l-2 2"/><path d="M3 11l6 6"/><path d="M14 4l6 6-3 3-6-6z"/><path d="M3 21l4-1 9-9-3-3-9 9z"/></svg></span> APIKey
     </div>
@@ -457,7 +460,7 @@ var panelHTML = `<!DOCTYPE html>
     <div class="sf-row"><span class="sf-dot" id="sfDot" style="background:var(--green)"></span><span id="sfStatus">运行中</span></div>
     <div class="sf-row"><span>密钥</span><span class="sf-num" id="sfKeys">0/0</span></div>
     <div class="sf-row"><span>代理</span><span class="sf-num" id="sfProxies">直连</span></div>
-    <div class="sf-row" style="font-size:10px;opacity:0.5">v2.5</div>
+    <div class="sf-row" style="font-size:10px;opacity:0.5">v1.1.0</div>
   </div>
 </aside>
 <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
@@ -601,7 +604,7 @@ var panelHTML = `<!DOCTYPE html>
           <thead><tr>
             <th style="width:28px"></th>
             <th>编号</th><th>权重</th><th>代理</th><th>状态</th><th>原因</th><th>恢复</th>
-            <th>余量</th><th>进行中</th><th>成功/失败</th>
+            <th>余量</th><th>墨点</th><th>进行中</th><th>成功/失败</th>
             <th>请求</th><th>输入</th><th>输出</th><th>合计</th><th class="right">操作</th>
           </tr></thead>
           <tbody id="keysBody"></tbody>
@@ -635,6 +638,32 @@ var panelHTML = `<!DOCTYPE html>
           <button class="btn primary" type="button" onclick="importBulk()">导入</button>
         </div>
       </details>
+    </section>
+  </div>
+
+  <!-- Stats / Credits (墨点) -->
+  <div class="section" id="sec-stats-credits">
+    <section>
+      <div class="sec-head"><h2>墨点统计</h2><span class="sec-sub">上游账户余额探测</span></div>
+      <p class="hint">墨点余额由上游账户共享，所有密钥共享同一账户的墨点。1墨点 ≈ 20,000,000 tokens。检测方式：向上游发送轻量请求探测账户状态。</p>
+      <div class="hero-stats" id="creditsHeroStats">
+        <div class="hero-stat"><span class="hs-k">可用账号</span><span class="hs-v ok" id="csWithCredits">—</span></div>
+        <div class="hero-stat"><span class="hs-k">墨点耗尽</span><span class="hs-v" id="csExhausted" style="color:var(--red)">—</span></div>
+        <div class="hero-stat"><span class="hs-k">未检测</span><span class="hs-v" id="csUnchecked" style="color:var(--dim)">—</span></div>
+        <div class="hero-stat"><span class="hs-k">总账号</span><span class="hs-v" id="csTotal">—</span></div>
+      </div>
+      <div class="row" style="margin:10px 0">
+        <button class="btn primary" onclick="refreshCredits()">刷新墨点</button>
+        <span class="muted" style="font-size:11px" id="creditsRefreshLbl"></span>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead><tr>
+            <th>编号</th><th>墨点状态</th><th>检测时间</th><th>状态码</th><th>错误信息</th>
+          </tr></thead>
+          <tbody id="creditsBody"></tbody>
+        </table>
+      </div>
     </section>
   </div>
 
@@ -1083,12 +1112,14 @@ function refresh() {
     doSlow ? api('/v0/management/api-keys') : Promise.resolve(_slowCache[0]),
     api('/v0/management/usage').catch(function(){ return {enabled:false}; }),
     doSlow ? api('/v0/management/proxies').catch(function(){ return {proxies:[]}; }) : Promise.resolve(_slowCache[1]),
-    doSlow ? api('/v0/management/settings').catch(function(){ return null; }) : Promise.resolve(_slowCache[2])
+    doSlow ? api('/v0/management/settings').catch(function(){ return null; }) : Promise.resolve(_slowCache[2]),
+    api('/v0/management/credits').catch(function(){ return {keys:[],summary:{}}; })
   ];
   Promise.all(reqs).then(function(all){
     if (doSlow) _slowCache = [all[2], all[4], all[5]];
     updateOverview(all[0], all[3], all[5]);
-    renderKeys(all[0], all[1], all[3], all[5]);
+    renderKeys(all[0], all[1], all[3], all[5], all[6]);
+    renderCredits(all[6]);
     if (doSlow) renderAPIKeys(all[2]);
     if (doSlow) renderProxies(all[4]);
     renderUsage(all[3]);
@@ -1109,11 +1140,15 @@ function toggleAuto() {
   AUTO = !AUTO;
   document.getElementById('autoBtn').textContent = AUTO ? '自动' : '手动';
 }
-function renderKeys(s, keys, usage, st) {
+function renderKeys(s, keys, usage, st, credits) {
   var total = s.keys_total || 0, healthy = s.keys_healthy || 0;
   var perKeyQuota = 0;
   if (st && st.account && st.account.token_quota) {
     perKeyQuota = st.account.token_quota;
+  }
+  var creditsByID = {};
+  if (credits && credits.keys) {
+    credits.keys.forEach(function(c) { creditsByID[c.id] = c; });
   }
   document.getElementById('keysPill').textContent = healthy + ' / ' + total;
   /* Chips */
@@ -1144,6 +1179,7 @@ function renderKeys(s, keys, usage, st) {
       + '<td class="muted" title="' + attr(k.proxy || '') + '">' + proxyLbl + '</td>'
       + '<td>' + pill(k.state) + '</td><td class="muted">' + esc(k.reason || '—') + '</td><td>' + until + '</td>'
       + '<td class="num">' + (perKeyQuota > 0 ? fmtTokens(Math.max(perKeyQuota - keyUsed, 0)) + ' / ' + fmtTokens(perKeyQuota) : (k.rpm_limit ? (k.rpm_remaining + '/' + k.rpm_limit) : '—')) + '</td>'
+      + '<td>' + creditBadge(creditsByID[k.id]) + '</td>'
       + '<td class="num">' + esc(k.inflight) + '</td>'
       + '<td class="num">' + esc(k.success_count) + '/<span class="' + (k.error_count ? 'err' : '') + '">' + esc(k.error_count) + '</span></td>'
       + '<td class="num">' + (u.requests || 0) + '</td>'
@@ -1152,7 +1188,7 @@ function renderKeys(s, keys, usage, st) {
       + '<td class="num">' + fmtTokens(keyUsed) + '</td>'
       + '<td class="right"><div class="actions">' + act + '</div></td></tr>';
   }).join('');
-  document.getElementById('keysBody').innerHTML = rows || emptyRow(15, '还没有上游账号，在下面添加');
+  document.getElementById('keysBody').innerHTML = rows || emptyRow(16, '还没有上游账号，在下面添加');
   keysSelUpdate();
 }
 
@@ -1170,6 +1206,52 @@ function keysSelUpdate() {
   if (el) el.textContent = n ? ('已选 ' + n + ' 个') : '未选中';
   var master = document.getElementById('keysSelectAll');
   if (master) master.checked = boxes.length > 0 && n === boxes.length;
+}
+
+function creditBadge(c) {
+  if (!c) return '<span class="muted">—</span>';
+  if (c.exhausted) return '<span style="color:var(--red);font-weight:600">✗</span>';
+  if (c.has_credits) return '<span style="color:var(--green);font-weight:600">✓</span>';
+  return '<span class="muted">—</span>';
+}
+
+function renderCredits(res) {
+  if (!res) return;
+  var sm = res.summary || {};
+  var el;
+  if (el = document.getElementById('csWithCredits')) el.textContent = sm.with_credits || 0;
+  if (el = document.getElementById('csExhausted')) el.textContent = sm.exhausted || 0;
+  if (el = document.getElementById('csUnchecked')) el.textContent = sm.unchecked || 0;
+  if (el = document.getElementById('csTotal')) el.textContent = sm.total || 0;
+  var rows = (res.keys || []).map(function(c) {
+    var statusLbl;
+    if (c.exhausted) statusLbl = '<span style="color:var(--red)">耗尽</span>';
+    else if (c.has_credits) statusLbl = '<span style="color:var(--green)">可用</span>';
+    else statusLbl = '<span class="muted">未检测</span>';
+    var lastCheck = c.last_check ? fmtTime(c.last_check) : '—';
+    var errInfo = c.last_error ? esc(c.last_error) : '—';
+    return '<tr><td class="mono">' + esc(c.id) + '</td>'
+      + '<td>' + statusLbl + '</td>'
+      + '<td class="muted">' + lastCheck + '</td>'
+      + '<td class="num">' + esc(c.status_code || '—') + '</td>'
+      + '<td class="muted">' + errInfo + '</td></tr>';
+  }).join('');
+  if (el = document.getElementById('creditsBody')) el.innerHTML = rows || emptyRow(5, '还没有墨点数据，点击上方刷新');
+}
+
+function refreshCredits() {
+  var lbl = document.getElementById('creditsRefreshLbl');
+  if (lbl) lbl.textContent = '检测中…';
+  api('/v0/management/credits', 'POST', {})
+    .then(function(res) {
+      renderCredits(res);
+      if (lbl) lbl.textContent = '已更新 ' + new Date().toLocaleTimeString();
+      toast('墨点检测完成');
+    })
+    .catch(function(e) {
+      if (lbl) lbl.textContent = '';
+      toast('墨点检测失败：' + e, true);
+    });
 }
 function keysBatchAct(action) {
   var boxes = document.querySelectorAll('.key-chk:checked');

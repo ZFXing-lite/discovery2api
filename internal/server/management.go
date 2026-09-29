@@ -90,7 +90,7 @@ func (s *Server) management(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case p == "/endpoints":
 		writeJSON(w, http.StatusOK, map[string]any{"endpoints": []string{
-			"/config", "/keys", "/keys/bulk", "/keys/batch", "/api-keys", "/usage", "/stats", "/proxies", "/settings", "/panel",
+			"/config", "/keys", "/keys/bulk", "/keys/batch", "/api-keys", "/usage", "/stats", "/credits", "/proxies", "/settings", "/panel",
 		}})
 	case p == "/config":
 		b, err := cfg.SnapshotJSON()
@@ -162,6 +162,12 @@ func (s *Server) management(w http.ResponseWriter, r *http.Request) {
 	case p == "/stats":
 		s.statsHandler(w, r)
 
+	case p == "/credits" && r.Method == http.MethodGet:
+		s.creditsHandler(w, r)
+	case p == "/credits" && r.Method == http.MethodPost:
+		s.CheckCredits()
+		s.creditsHandler(w, r)
+
 	case p == "/proxies" && r.Method == http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]any{"proxies": proxyStatusList(s.proxies)})
 	case p == "/proxies" && r.Method == http.MethodPut:
@@ -191,7 +197,7 @@ func isKnownManagementPath(p string) bool {
 		return strings.HasSuffix(p, "/disable") || strings.HasSuffix(p, "/enable")
 	case strings.HasPrefix(p, "/api-keys/"):
 		return true
-	case p == "/proxies", p == "/settings", p == "/keys", p == "/keys/bulk", p == "/keys/batch", p == "/api-keys":
+	case p == "/proxies", p == "/settings", p == "/keys", p == "/keys/bulk", p == "/keys/batch", p == "/api-keys", p == "/credits":
 		return true
 	}
 	return false
@@ -673,6 +679,50 @@ func (s *Server) statsHandler(w http.ResponseWriter, r *http.Request) {
 		resp["proxies_total"] = len(s.proxies.Status())
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// creditsHandler returns the cached 墨点 (ink points) credit status for all
+// keys plus a summary. POST /v0/management/credits triggers a fresh probe
+// before returning.
+func (s *Server) creditsHandler(w http.ResponseWriter, r *http.Request) {
+	if s.credits == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"keys":    []any{},
+			"summary": map[string]int{"total": 0, "with_credits": 0, "exhausted": 0, "unchecked": 0},
+		})
+		return
+	}
+	total, _ := s.pool.Summary()
+	statuses := s.credits.Status()
+	summary := s.credits.Summarize(total)
+
+	type keyOut struct {
+		ID         string `json:"id"`
+		HasCredits bool   `json:"has_credits"`
+		Exhausted  bool   `json:"exhausted"`
+		LastCheck  string `json:"last_check"`
+		StatusCode int    `json:"status_code"`
+		LastError  string `json:"last_error,omitempty"`
+	}
+	keys := make([]keyOut, 0, len(statuses))
+	for _, cs := range statuses {
+		lastCheck := ""
+		if !cs.LastCheck.IsZero() {
+			lastCheck = cs.LastCheck.UTC().Format("2006-01-02T15:04:05Z")
+		}
+		keys = append(keys, keyOut{
+			ID:         cs.ID,
+			HasCredits: cs.HasCredits,
+			Exhausted:  cs.Exhausted,
+			LastCheck:  lastCheck,
+			StatusCode: cs.StatusCode,
+			LastError:  cs.LastError,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"keys":    keys,
+		"summary": summary,
+	})
 }
 
 func decodeBody(r *http.Request, v any) error {

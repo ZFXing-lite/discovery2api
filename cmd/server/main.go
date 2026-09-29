@@ -143,6 +143,8 @@ func main() {
 	go watcher.Run(ctx, cfg)
 	go proxyHealth(ctx, proxies, cfg)
 	go upstreamHealth(ctx, pool, cfg)
+	// Credits (墨点) probe: checks all keys every 5 minutes by default.
+	srv.StartCreditsLoop(ctx, time.Duration(cfg.Credits.CheckEvery))
 	if cfg.Metrics.Enabled {
 		go rec.FlushLoop(ctx, time.Duration(cfg.Metrics.FlushEvery))
 	}

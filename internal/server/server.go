@@ -4,6 +4,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ZFXing-lite/discovery2api/internal/config"
+	"github.com/ZFXing-lite/discovery2api/internal/credits"
 	"github.com/ZFXing-lite/discovery2api/internal/keypool"
 	"github.com/ZFXing-lite/discovery2api/internal/metrics"
 	"github.com/ZFXing-lite/discovery2api/internal/proxypool"
@@ -49,6 +51,8 @@ type Server struct {
 	// lastPersistErr is the most recent config save failure, so the panel can
 	// say why an add failed instead of a generic conflict.
 	lastPersistErr atomic.Value
+	// credits probes upstream keys for 墨点 (ink points) balance status.
+	credits *credits.Probe
 }
 
 func New(cfg *config.Config, relayer *relay.Relayer, pool *keypool.Pool,
@@ -58,6 +62,12 @@ func New(cfg *config.Config, relayer *relay.Relayer, pool *keypool.Pool,
 		log: slog.With("component", "server"), started: time.Now()}
 	s.cfg.Store(cfg)
 	s.mgmtOn.Store(true)
+	// Credits probe: lightweight GET /v1/models to detect 墨点 exhaustion.
+	timeout := time.Duration(cfg.Credits.Timeout)
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	s.credits = credits.New(cfg.Upstream.BaseURL, timeout)
 	return s
 }
 
@@ -421,3 +431,65 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.WriteHeader(code)
 	_, _ = w.Write(b)
 }
+
+// --- credits (墨点) probe -------------------------------------------------
+
+// creditsTransportFactory returns a TransportFactory for the credits probe that
+// respects per-key proxy overrides and the shared SOCKS5 proxy pool, matching
+// the relay's transport selection logic.
+func (s *Server) creditsTransportFactory() credits.TransportFactory {
+	return func(id, proxyURL string) *http.Transport {
+		if proxyURL != "" {
+			return proxypool.TransportForURL(proxyURL)
+		}
+		if s.proxies != nil && !s.proxies.Empty() {
+			return s.proxies.Transport(id, nil)
+		}
+		return proxypool.TransportForURL("none")
+	}
+}
+
+// CheckCredits probes all upstream keys for 墨点 (ink points) credit status.
+// It is called by the background loop and by the management API POST endpoint.
+func (s *Server) CheckCredits() {
+	if s.credits == nil || s.pool == nil {
+		return
+	}
+	rawInfo := s.pool.RawKeyInfo()
+	if len(rawInfo) == 0 {
+		return
+	}
+	keys := make([]credits.KeyInfo, 0, len(rawInfo))
+	for _, ri := range rawInfo {
+		keys = append(keys, credits.KeyInfo{ID: ri.ID, Key: ri.Key, ProxyURL: ri.ProxyURL})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	s.credits.CheckAll(ctx, keys, s.creditsTransportFactory())
+	slog.Info("credits probe completed", "keys", len(keys))
+}
+
+// StartCreditsLoop runs a background goroutine that probes all keys every
+// checkEvery. It stops when ctx is done.
+func (s *Server) StartCreditsLoop(ctx context.Context, checkEvery time.Duration) {
+	if s.credits == nil || checkEvery <= 0 {
+		return
+	}
+	go func() {
+		// Run once shortly after startup so the panel has data immediately.
+		s.CheckCredits()
+		t := time.NewTicker(checkEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.CheckCredits()
+			}
+		}
+	}()
+}
+
+// CreditsProbe returns the credits probe for direct access (e.g. management API).
+func (s *Server) CreditsProbe() *credits.Probe { return s.credits }

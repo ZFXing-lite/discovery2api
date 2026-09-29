@@ -904,6 +904,47 @@ func (p *Pool) Status() []EntryStatus {
 	return out
 }
 
+// RawKeys returns the id→raw-key mapping for all keys in the pool. This is
+// used by the credits probe to send authenticated requests upstream. The
+// returned map must not be retained across mutations.
+func (p *Pool) RawKeys() map[string]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string]string, len(p.byID))
+	for id, e := range p.byID {
+		out[id] = e.Key
+	}
+	return out
+}
+
+// RawKeyInfo returns id, raw key and proxy URL for every key in config order.
+// Used by the credits probe to check each key with its per-key proxy override.
+func (p *Pool) RawKeyInfo() []struct {
+	ID       string
+	Key      string
+	ProxyURL string
+} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]struct {
+		ID       string
+		Key      string
+		ProxyURL string
+	}, 0, len(p.order))
+	for _, id := range p.order {
+		e := p.byID[id]
+		if e == nil {
+			continue
+		}
+		out = append(out, struct {
+			ID       string
+			Key      string
+			ProxyURL string
+		}{ID: e.ID, Key: e.Key, ProxyURL: e.Proxy})
+	}
+	return out
+}
+
 // Summary returns light-weight counters for logs and health endpoints.
 func (p *Pool) Summary() (total, healthy int) {
 	p.mu.Lock()

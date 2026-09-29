@@ -69,3 +69,10 @@ metrics:
 remote-management:
   allow-remote: true
   secret-key: ""
+
+# Credits (墨点) probe. The upstream has no balance API; the gateway probes
+# each key with a lightweight GET /v1/models to detect credit exhaustion.
+# 1墨点 ≈ 20,000,000 tokens. All keys under one account share the same balance.
+credits:
+  check-every: 5m
+  timeout: 10s

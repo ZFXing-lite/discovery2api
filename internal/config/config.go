@@ -32,6 +32,13 @@ type Config struct {
 	Log        Log        `yaml:"log"`
 	Metrics    Metrics    `yaml:"metrics"`
 	Management Management `yaml:"remote-management"`
+	Credits    Credits    `yaml:"credits"`
+}
+
+// Credits configures the upstream 墨点 (ink points) credit probe.
+type Credits struct {
+	CheckEvery Duration `yaml:"check-every"`
+	Timeout    Duration `yaml:"timeout"`
 }
 
 // Account holds the upstream Intern Discovery account quota info shown in the panel.
@@ -204,6 +211,10 @@ func Default() *Config {
 		// The panel is the setup UI, so a deployed instance must be reachable
 		// from a browser. The password is still required; see normalize.
 		Management: Management{AllowRemote: true},
+		Credits: Credits{
+			CheckEvery: Duration(5 * time.Minute),
+			Timeout:    Duration(10 * time.Second),
+		},
 	}
 }
 
@@ -307,6 +318,12 @@ func (c *Config) normalize() error {
 	}
 	if strings.TrimSpace(c.Management.SecretKey) == "" {
 		return fmt.Errorf("panel password is required: set DISCOVERY2API_MGMT_KEY or remote-management.secret-key")
+	}
+	if c.Credits.CheckEvery <= 0 {
+		c.Credits.CheckEvery = Duration(5 * time.Minute)
+	}
+	if c.Credits.Timeout <= 0 {
+		c.Credits.Timeout = Duration(10 * time.Second)
 	}
 	return nil
 }
