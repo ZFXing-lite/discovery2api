@@ -21,7 +21,7 @@ var panelHTML = `<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>discovery2api v2.5</title>
+<title>discovery2api v1.1.0</title>
 <style id="daisyui-css">` + daisyuiCSS + `</style>
 <style id="daisyui-themes">` + daisyuiThemesCSS + `</style>
 <style>

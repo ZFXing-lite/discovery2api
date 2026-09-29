@@ -131,9 +131,9 @@ func (s *Server) relay(kind relay.Kind) http.HandlerFunc {
 }
 
 // models proxies /v1/models to the upstream when keys are available, falling
-// back to a minimal static catalog when the pool is empty or the upstream is
-// unreachable. The Discovery platform supports multiple models, so proxying
-// gives clients the real list.
+// back to a static catalog of known Discovery models when the pool is empty or
+// the upstream is unreachable. The Discovery platform supports multiple models,
+// so proxying gives clients the real list.
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.Load()
 	baseURL := strings.TrimRight(cfg.Upstream.BaseURL, "/")
@@ -146,45 +146,86 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 		if reqErr == nil {
 			upReq.Header.Set("Authorization", "Bearer "+lease.Entry.Key)
 			upReq.Header.Set("Accept", "application/json")
-			client := &http.Client{Timeout: 10 * time.Second}
+			// Use the relayer's transport so SOCKS5 proxy pool and per-key
+			// proxy overrides apply to the models fetch too.
+			var client *http.Client
+			if s.relayer != nil {
+				rt := s.relayer.TransportFor(lease, relay.Config{
+					BaseURL:        baseURL,
+					ConnectTimeout: time.Duration(cfg.Upstream.ConnectTimeout),
+				})
+				client = &http.Client{Transport: rt, Timeout: 10 * time.Second}
+			} else {
+				client = &http.Client{Timeout: 10 * time.Second}
+			}
 			resp, doErr := client.Do(upReq)
 			if doErr == nil {
-				defer resp.Body.Close()
-				if resp.StatusCode == http.StatusOK {
-					body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-					lease.Release()
-					if readErr == nil && len(body) > 0 {
-						w.Header().Set("Content-Type", "application/json")
-						w.WriteHeader(http.StatusOK)
-						_, _ = w.Write(body)
-						return
-					}
-				}
+				body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 				resp.Body.Close()
+				lease.Release()
+				if readErr == nil && resp.StatusCode == http.StatusOK && len(body) > 0 {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write(body)
+					return
+				}
+			} else {
+				lease.Release()
 			}
+		} else {
+			lease.Release()
 		}
-		lease.Release()
 	}
 
-	// Fallback: return the configured default model.
+	// Fallback: return a static catalog of known Discovery models.
+	s.serveStaticModels(w, r, cfg)
+}
+
+// knownDiscoveryModels is the fallback catalog used when the upstream is
+// unreachable or no keys are configured. These are the models documented on
+// the Intern Discovery platform.
+var knownDiscoveryModels = []map[string]any{
+	{"id": "auto", "object": "model", "owned_by": "discovery", "context_length": 256000},
+	{"id": "deepseek-v3", "object": "model", "owned_by": "discovery", "context_length": 64000},
+	{"id": "deepseek-r1", "object": "model", "owned_by": "discovery", "context_length": 64000},
+	{"id": "glm-4", "object": "model", "owned_by": "discovery", "context_length": 128000},
+	{"id": "glm-4-flash", "object": "model", "owned_by": "discovery", "context_length": 128000},
+	{"id": "qwen-plus", "object": "model", "owned_by": "discovery", "context_length": 131072},
+	{"id": "qwen-turbo", "object": "model", "owned_by": "discovery", "context_length": 8192},
+	{"id": "kimi-k1.5", "object": "model", "owned_by": "discovery", "context_length": 128000},
+}
+
+// serveStaticModels returns a static model catalog. Anthropic clients get the
+// Anthropic-shaped response; everyone else gets the OpenAI-shaped one.
+func (s *Server) serveStaticModels(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
 	model := cfg.Upstream.DefaultModel
-	if strings.Contains(strings.ToLower(r.Header.Get("anthropic-version")), "1.0") ||
-		strings.Contains(strings.ToLower(r.UserAgent()), "claude") {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"data": []map[string]any{{
-				"type": "model", "id": model, "display_name": model,
+	if model == "" {
+		model = "auto"
+	}
+	isAnthropic := strings.Contains(strings.ToLower(r.Header.Get("anthropic-version")), "1.0") ||
+		strings.Contains(strings.ToLower(r.UserAgent()), "claude")
+	if isAnthropic {
+		data := make([]map[string]any, 0, len(knownDiscoveryModels))
+		for _, m := range knownDiscoveryModels {
+			data = append(data, map[string]any{
+				"type": "model", "id": m["id"], "display_name": m["id"],
 				"created_at": s.started.Unix(),
-			}},
-		})
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": data})
 		return
+	}
+	data := make([]map[string]any, 0, len(knownDiscoveryModels))
+	for _, m := range knownDiscoveryModels {
+		entry := map[string]any{
+			"id": m["id"], "object": "model", "created": s.started.Unix(),
+			"owned_by": m["owned_by"], "context_length": m["context_length"],
+		}
+		data = append(data, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data": []map[string]any{{
-			"id": model, "object": "model", "created": s.started.Unix(),
-			"owned_by":       "discovery",
-			"context_length": 128000,
-		}},
+		"data":   data,
 	})
 }
 

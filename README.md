@@ -4,7 +4,7 @@
 
 <h1 align="center">🔬 Intern Discovery API 网关 (discovery2api)</h1>
 
-<p align="center"><strong>Version 1.0.0</strong></p>
+<p align="center"><strong>Version 1.1.0</strong></p>
 
 <p align="center">
   <em>单二进制 + 一个 YAML 配置 · 无数据库 · 零运行时依赖 · 把任意 OpenAI / Anthropic / Responses 兼容客户端指向它，填入 Intern InkStone API Key，剩下的轮询、限速、重试和 SOCKS5 出口全交给网关。Please star ⭐</em>
@@ -16,7 +16,7 @@
   <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=fff" alt="Go"></a>
   <br>
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey" alt="Platform">
-  <img src="https://img.shields.io/badge/version-1.0.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.1.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/dependencies-zero-success" alt="Zero deps">
 </p>
 

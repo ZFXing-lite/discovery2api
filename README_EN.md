@@ -60,7 +60,7 @@ curl -X POST http://127.0.0.1:8319/v1/chat/completions \
 | Anthropic SDK / Claude Code | `http://host:8319` | `/v1/messages` (`x-api-key`) |
 | Codex / Qoder | `http://host:8319/v1` | `/v1/responses` |
 
-`GET /v1/models` returns the fixed `auto` entry.
+`GET /v1/models` proxies the upstream when keys are available, falling back to a static catalog of known Discovery models.
 
 ## Configuration
 
@@ -75,7 +75,7 @@ api-keys: ["gw-change-me-1"]        # keys clients use on THIS gateway
 upstream:
   base-url: "https://discovery-api.intern-ai.org.cn"
   default-model: "auto"
-  force-model: true                  # rewrite request "model" to default-model
+  force-model: false                 # rewrite request "model" to default-model
   keys:
     - key: "xxx"
       weight: 1                      # weighted round-robin
@@ -126,8 +126,8 @@ rate-limit:
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
 | `POST /v1/messages` | Anthropic Messages (`x-api-key`) |
 | `POST /v1/responses` | OpenAI Responses |
-| `GET /v1/models` | Fixed model catalog |
-| `GET /healthz` | Liveness (503 when no key is usable) |
+| `GET /v1/models` | Model catalog (proxies upstream; static fallback) |
+| `GET /healthz` | Liveness (always 200; `ready` flag shows key availability) |
 | `GET /status` | Masked pool + usage snapshot |
 | `*/v0/management/*` | Ops API (disabled unless `remote-management.secret-key` set) |
 
@@ -167,6 +167,8 @@ go build -ldflags="-s -w" -o discovery2api ./cmd/server
   single account's RPM.
 - `auto` is text-only (256K context); the gateway forwards
   request bodies as-is and does not transcode multimodal input.
+  Other models (deepseek-v3, deepseek-r1, glm-4, qwen-plus, etc.)
+  are also available; use `GET /v1/models` to see the full list.
 - Output-length caps (`max_completion_tokens` / `max_tokens` /
   `max_output_tokens`, 1-65536) are enforced upstream.
 

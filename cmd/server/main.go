@@ -235,7 +235,12 @@ func warnPlaceholders(cfg *config.Config) {
 func isPlaceholder(k string) bool {
 	lk := strings.ToLower(k)
 	for _, p := range []string{"xxx", "your", "placeholder", "example", "change_me"} {
-		if lk == p || strings.Contains(lk, p) && (p == "xxx" || strings.Contains(lk, "your") || strings.Contains(lk, "example")) {
+		if lk == p {
+			return true
+		}
+	}
+	for _, p := range []string{"xxx", "your", "example", "placeholder", "change_me"} {
+		if strings.Contains(lk, p) {
 			return true
 		}
 	}
@@ -282,11 +287,28 @@ func upstreamHealth(ctx context.Context, pool *keypool.Pool, cfg *config.Config)
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			// Pick a key so the probe authenticates and the upstream
+			// actually serves a response instead of a 401 that tells
+			// us nothing about model availability.
+			lease, err := pool.Pick(nil)
+			authHeader := ""
+			if err == nil {
+				authHeader = lease.Entry.Key
+			}
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 			if err != nil {
+				if authHeader != "" {
+					lease.Release()
+				}
 				continue
 			}
+			if authHeader != "" {
+				req.Header.Set("Authorization", "Bearer "+authHeader)
+			}
 			resp, err := client.Do(req)
+			if authHeader != "" {
+				lease.Release()
+			}
 			if err != nil {
 				n := pool.HealthCheckAll(coolDur, "upstream probe: "+err.Error())
 				if n > 0 {

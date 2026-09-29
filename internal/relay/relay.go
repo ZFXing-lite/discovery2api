@@ -487,6 +487,19 @@ func (r *Relayer) pipeStream(w http.ResponseWriter, req *http.Request, resp *htt
 				return cw, committed, err
 			}
 		case err := <-errc:
+			// Drain any data chunks that were sent before the error so the
+			// last SSE event is not lost to a race between ch and errc.
+			for {
+				select {
+				case c := <-ch:
+					if _, err := cw.Write(c.data); err != nil {
+						return cw, committed, err
+					}
+				default:
+					goto done
+				}
+			}
+		done:
 			if err == io.EOF || err == req.Context().Err() {
 				return cw, committed, nil
 			}
@@ -570,6 +583,13 @@ func findUsageInStream(tail []byte, kind Kind) usage {
 	}
 	return parseUsage(kind, tail)
 }
+// TransportFor returns a cached RoundTripper for the given lease and config.
+// Exported so the models endpoint can reuse the same transport (with SOCKS5
+// proxy pool and per-key overrides) as regular relay requests.
+func (r *Relayer) TransportFor(lease keypool.Lease, cfg Config) http.RoundTripper {
+	return r.transportFor(lease, cfg)
+}
+
 func (r *Relayer) transportFor(lease keypool.Lease, cfg Config) http.RoundTripper {
 	// Cache the final RoundTripper per (keyID, proxyURL, connectTimeout) so
 	// TCP+TLS connections are reused across requests. A config change (e.g.
