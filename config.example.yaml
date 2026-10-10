@@ -31,6 +31,19 @@ upstream:
     # - key: "your-key-here"
     #   weight: 1
     #   proxy: ""            # optional per-key override: a socks5:// URL, or "none"
+  # Background upstream outage probe. Each round samples sample-size keys
+  # with a GET /v1/models; only fail-threshold consecutive fully-failed
+  # rounds cool the whole pool (for cool-duration). Rounds back off
+  # exponentially up to max-backoff while failures persist. 429/401/403 on
+  # the probe are treated as key-level signals and never cool the pool.
+  # The probe doubles as the /v1/models cache warmer: 2xx bodies feed the
+  # model cache, so /v1/models stays up through upstream blips.
+  health:
+    probe-every: 30s
+    fail-threshold: 3
+    sample-size: 3
+    cool-duration: 30s
+    max-backoff: 10m
 
 # SOCKS5 egress pool. Leave the list empty for a direct connection.
 proxy:

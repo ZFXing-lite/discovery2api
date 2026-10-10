@@ -163,6 +163,7 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 	var lastErr string
 	var poolErr error
 	committed := false // true once any bytes were written to the client
+	attempts := 0      // real upstream calls made (for honest logging)
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
@@ -199,6 +200,7 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 		tried[lease.Entry.ID] = true
 
 		status, upstreamBody, streamed, ferr, limits := r.forwardOnce(w, req, kind, cfg, lease, body, streaming)
+		attempts++
 		lastStatus = status
 		if streamed {
 			committed = true
@@ -236,7 +238,12 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 			return
 		}
 
-		// Decide whether a rotation can help.
+		// Decide whether a rotation can help. shouldRotate already encodes
+		// the retry policy: transport errors, retry-on statuses and 401
+		// rotate; any other 4xx is a deterministic client error (bad model
+		// name, malformed body) that another key cannot fix, so we break
+		// and surface the upstream response verbatim — no wasted retries,
+		// no artificial client wait (fast-fail).
 		if !r.shouldRotate(status, ferr, streamed) {
 			break
 		}
@@ -250,7 +257,11 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 		hdr := w.Header()
 		hdr.Set("Content-Type", "application/json")
 		writeBody(w, lastStatus, lastUpstreamBody)
-		r.log.Warn("request failed after retries", "kind", kind, "status", lastStatus, "err", lastErr)
+		// attempts = real upstream calls made. Deterministic 4xx break out
+		// early, so "after retries" was previously a lie for them — log
+		// the truth instead.
+		r.log.Warn("request failed", "kind", kind, "status", lastStatus,
+			"attempts", attempts, "err", lastErr)
 		return
 	}
 	if committed {

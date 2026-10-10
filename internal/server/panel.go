@@ -808,6 +808,11 @@ var KEY = sessionStorage.getItem('discovery2api_mgmt') || '';
 var AUTO = true, TIMER = null;
 var currentSection = 'overview';
 
+/* hs: set textContent of an element by id, skipping no-op writes so the 2s
+   auto-refresh doesn't thrash the DOM. Global because several top-level
+   render functions (renderTokenStats, updateOverview) share it. */
+function hs(id, v) { var e = document.getElementById(id); if (e && e.textContent !== String(v)) e.textContent = v; }
+
 /* ── Theme ── */
 function initTheme() {
   var t = localStorage.getItem('discovery2api_theme') || 'light';
@@ -931,7 +936,6 @@ function updateOverview(s, usage, st) {
   if (lbl.textContent !== txt) lbl.textContent = txt;
 
   /* Hero stats */
-  var hs = function(id, v) { var e = document.getElementById(id); if (e && e.textContent !== String(v)) e.textContent = v; };
   hs('heroUpstream', p.upstream || '—');
   hs('hsKeys', (s.keys_healthy || 0) + ' / ' + (s.keys_total || 0));
   hs('hsProxies', (s.proxies_total || 0) ? ((s.proxies_total || 0) + ' 个') : '直连');

@@ -53,6 +53,9 @@ type Server struct {
 	lastPersistErr atomic.Value
 	// credits probes upstream keys for 墨点 (ink points) balance status.
 	credits *credits.Probe
+	// mc caches the upstream /v1/models response so a flaky upstream cannot
+	// blank the models endpoint (stale-while-error, singleflight refresh).
+	mc *ModelCache
 }
 
 func New(cfg *config.Config, relayer *relay.Relayer, pool *keypool.Pool,
@@ -68,6 +71,41 @@ func New(cfg *config.Config, relayer *relay.Relayer, pool *keypool.Pool,
 		timeout = 10 * time.Second
 	}
 	s.credits = credits.New(cfg.Upstream.BaseURL, timeout)
+	s.mc = NewModelCache()
+	// Attach a fetch that reuses the relayer transport so SOCKS5 proxy pool
+	// and per-key proxy overrides apply to model-list fetches too.
+	if relayer != nil {
+		s.mc.SetFetch(func() ([]byte, int, error) {
+			lease, err := pool.Pick(nil)
+			if err != nil {
+				return nil, 0, err
+			}
+			defer lease.Release()
+			c := cfg
+			baseURL := strings.TrimRight(c.Upstream.BaseURL, "/")
+			req, err := http.NewRequest(http.MethodGet, baseURL+"/v1/models", nil)
+			if err != nil {
+				return nil, 0, err
+			}
+			req.Header.Set("Authorization", "Bearer "+lease.Entry.Key)
+			req.Header.Set("Accept", "application/json")
+			rt := relayer.TransportFor(lease, relay.Config{
+				BaseURL:        baseURL,
+				ConnectTimeout: time.Duration(c.Upstream.ConnectTimeout),
+			})
+			client := &http.Client{Transport: rt, Timeout: 15 * time.Second}
+			resp, err := client.Do(req)
+			if err != nil {
+				return nil, 0, err
+			}
+			defer resp.Body.Close()
+			b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			if err != nil {
+				return nil, 0, err
+			}
+			return b, resp.StatusCode, nil
+		})
+	}
 	return s
 }
 
@@ -140,53 +178,21 @@ func (s *Server) relay(kind relay.Kind) http.HandlerFunc {
 	}
 }
 
-// models proxies /v1/models to the upstream when keys are available, falling
-// back to a static catalog of known Discovery models when the pool is empty or
-// the upstream is unreachable. The Discovery platform supports multiple models,
-// so proxying gives clients the real list.
+// models serves the upstream model list from the cache. The cache is fed by
+// the background probe loop and its own refresh loop; a client request only
+// triggers an upstream fetch when the cache is cold (singleflight — at most
+// one fetch, concurrent callers wait). When even that fails we fall back to
+// the static catalog. Upstream blips therefore never blank /v1/models.
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.Load()
-	baseURL := strings.TrimRight(cfg.Upstream.BaseURL, "/")
-
-	// Try to proxy to upstream when we have keys.
-	lease, err := s.pool.Pick(nil)
-	if err == nil {
-		upURL := baseURL + "/v1/models"
-		upReq, reqErr := http.NewRequestWithContext(r.Context(), http.MethodGet, upURL, nil)
-		if reqErr == nil {
-			upReq.Header.Set("Authorization", "Bearer "+lease.Entry.Key)
-			upReq.Header.Set("Accept", "application/json")
-			// Use the relayer's transport so SOCKS5 proxy pool and per-key
-			// proxy overrides apply to the models fetch too.
-			var client *http.Client
-			if s.relayer != nil {
-				rt := s.relayer.TransportFor(lease, relay.Config{
-					BaseURL:        baseURL,
-					ConnectTimeout: time.Duration(cfg.Upstream.ConnectTimeout),
-				})
-				client = &http.Client{Transport: rt, Timeout: 10 * time.Second}
-			} else {
-				client = &http.Client{Timeout: 10 * time.Second}
-			}
-			resp, doErr := client.Do(upReq)
-			if doErr == nil {
-				body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-				resp.Body.Close()
-				lease.Release()
-				if readErr == nil && resp.StatusCode == http.StatusOK && len(body) > 0 {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusOK)
-					_, _ = w.Write(body)
-					return
-				}
-			} else {
-				lease.Release()
-			}
-		} else {
-			lease.Release()
+	if s.mc != nil {
+		if body, err := s.mc.get(); err == nil && len(body) > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+			return
 		}
 	}
-
 	// Fallback: return a static catalog of known Discovery models.
 	s.serveStaticModels(w, r, cfg)
 }
@@ -470,7 +476,9 @@ func (s *Server) CheckCredits() {
 }
 
 // StartCreditsLoop runs a background goroutine that probes all keys every
-// checkEvery. It stops when ctx is done.
+// checkEvery. It stops when ctx is done. While the upstream is believed down
+// (pool fully cooled by the outage detector), rounds are skipped so the
+// probe does not add load to a struggling upstream or flip-flop key states.
 func (s *Server) StartCreditsLoop(ctx context.Context, checkEvery time.Duration) {
 	if s.credits == nil || checkEvery <= 0 {
 		return
@@ -485,10 +493,25 @@ func (s *Server) StartCreditsLoop(ctx context.Context, checkEvery time.Duration)
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				if total, healthy := s.pool.Summary(); total > 0 && healthy == 0 {
+					s.log.Debug("credits probe skipped: upstream in outage cooldown")
+					continue
+				}
 				s.CheckCredits()
 			}
 		}
 	}()
+}
+
+// ModelCache returns the /v1/models cache (may be nil in tests).
+func (s *Server) ModelCache() *ModelCache { return s.mc }
+
+// StartModelCache launches the cache background refresh loop.
+func (s *Server) StartModelCache(interval time.Duration) {
+	if s.mc == nil {
+		return
+	}
+	s.mc.Start(interval)
 }
 
 // CreditsProbe returns the credits probe for direct access (e.g. management API).

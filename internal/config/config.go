@@ -71,6 +71,20 @@ type APIKeyEntry struct {
 	Name string `yaml:"name" json:"name"`
 }
 
+// UpstreamHealth tunes the background upstream outage probe. One probe round
+// samples sample-size keys with a lightweight authenticated GET /v1/models;
+// only after fail-threshold consecutive fully-failed rounds is the whole pool
+// cooled for cool-duration. Probe rounds back off exponentially (capped at
+// max-backoff) while failures persist, so a flapping upstream is not hammered
+// and one transient blip can no longer take the whole gateway down.
+type UpstreamHealth struct {
+	ProbeEvery    Duration `yaml:"probe-every"`
+	FailThreshold int      `yaml:"fail-threshold"`
+	SampleSize    int      `yaml:"sample-size"`
+	CoolDuration  Duration `yaml:"cool-duration"`
+	MaxBackoff    Duration `yaml:"max-backoff"`
+}
+
 // Upstream describes the single Intern Discovery API endpoint. The base URL is shared by
 // all three interfaces per the API documentation.
 type Upstream struct {
@@ -82,6 +96,11 @@ type Upstream struct {
 	// ForceModel rewrites request body "model" to DefaultModel so clients that
 	// send a stale/other model id still work (Intern Discovery only exposes one model).
 	ForceModel bool `yaml:"force-model"`
+	// Health configures the background outage probe (see UpstreamHealth). The
+	// probe doubles as the /v1/models cache warmer: any 2xx probe body feeds
+	// the model cache, so no separate refresh loop or extra upstream traffic
+	// exists.
+	Health UpstreamHealth `yaml:"health"`
 }
 
 type Proxy struct {

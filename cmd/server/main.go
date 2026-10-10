@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -142,7 +143,9 @@ func main() {
 	go pool.FlushLoop(ctx, time.Duration(cfg.Metrics.FlushEvery))
 	go watcher.Run(ctx, cfg)
 	go proxyHealth(ctx, proxies, cfg)
-	go upstreamHealth(ctx, pool, cfg)
+	// Model cache: refresh every 60s (probe loop also feeds it for free).
+	srv.StartModelCache(60 * time.Second)
+	go upstreamHealth(ctx, pool, cfg, srv.ModelCache())
 	// Credits (墨点) probe: checks all keys every 5 minutes by default.
 	srv.StartCreditsLoop(ctx, time.Duration(cfg.Credits.CheckEvery))
 	if cfg.Metrics.Enabled {
@@ -269,69 +272,129 @@ func proxyHealth(ctx context.Context, p *proxypool.Pool, cfg *config.Config) {
 	}
 }
 
-// upstreamHealth pings the upstream API every 30s. On failure it cools every
-// non-disabled key for 30s so the pool stops sending traffic until the next
-// probe succeeds. This catches 502/503 outages faster than waiting for client
-// requests to hit them one key at a time.
-func upstreamHealth(ctx context.Context, pool *keypool.Pool, cfg *config.Config) {
+// upstreamHealth is the background outage detector. Every probe round it
+// samples several keys (not one) with a lightweight GET /v1/models and a
+// short timeout. A single failed round does nothing drastic: the circuit
+// only trips after fail-threshold consecutive fully-failed rounds, and the
+// probe interval backs off exponentially while upstream stays dark, so a
+// flaky upstream is neither hammered nor allowed to blank the pool on one
+// blip. 429/401 on the probe are treated as key-level signals (the upstream
+// is answering; the sampled key or quota is the problem) and never cool the
+// whole pool. On a 2xx probe the response body feeds the model cache.
+func upstreamHealth(ctx context.Context, pool *keypool.Pool, cfg *config.Config, mc *server.ModelCache) {
 	base := strings.TrimRight(cfg.Upstream.BaseURL, "/")
 	if base == "" {
 		return
 	}
 	probeURL := base + "/v1/models"
-	every := 30 * time.Second
-	coolDur := 30 * time.Second
-	t := time.NewTicker(every)
-	defer t.Stop()
+	hc := cfg.Upstream.Health
+	every := time.Duration(hc.ProbeEvery)
+	if every <= 0 {
+		every = 30 * time.Second
+	}
+	coolDur := time.Duration(hc.CoolDuration)
+	if coolDur <= 0 {
+		coolDur = 30 * time.Second
+	}
+	sample := hc.SampleSize
+	if sample <= 0 {
+		sample = 3
+	}
+	threshold := hc.FailThreshold
+	if threshold <= 0 {
+		threshold = 3
+	}
+	maxBackoff := time.Duration(hc.MaxBackoff)
+	if maxBackoff <= 0 {
+		maxBackoff = 10 * time.Minute
+	}
 	client := &http.Client{Timeout: 10 * time.Second}
+	fails := 0
+	interval := every
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			// Pick a key so the probe authenticates and the upstream
-			// actually serves a response instead of a 401 that tells
-			// us nothing about model availability.
-			lease, err := pool.Pick(nil)
-			authHeader := ""
-			if err == nil {
-				authHeader = lease.Entry.Key
-			}
+		case <-time.After(interval):
+		}
+		keys := pool.SampleKeys(sample)
+		var okBody []byte
+		// A round is failed UNLESS the upstream proves alive through at
+		// least one sampled key (any 2xx/429/401/403 answer counts — those
+		// all come from a living upstream). With no eligible keys the
+		// round is failed as well. Transport errors and 5xx on every key
+		// mean the upstream is dark: that is what trips the breaker.
+		roundFailed := true
+		if len(keys) == 0 {
+			// No eligible keys to probe. The pool is empty or fully
+			// cooled; nothing to do this round and no signal either way —
+			// do not count it as a failure (it would double-cool a pool
+			// already in cooldown) nor as a success (which would clear
+			// cooldowns without proof).
+			continue
+		}
+		for _, key := range keys {
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 			if err != nil {
-				if authHeader != "" {
-					lease.Release()
-				}
-				continue
+				continue // request-build bug: keep the pessimistic default
 			}
-			if authHeader != "" {
-				req.Header.Set("Authorization", "Bearer "+authHeader)
-			}
+			req.Header.Set("Authorization", "Bearer "+key)
 			resp, err := client.Do(req)
-			if authHeader != "" {
-				lease.Release()
-			}
 			if err != nil {
-				n := pool.HealthCheckAll(coolDur, "upstream probe: "+err.Error())
-				if n > 0 {
-					slog.Warn("upstream health probe failed", "url", probeURL, "err", err, "keys_cooled", n)
-				}
-				continue
+				slog.Debug("upstream probe: key failed", "err", err)
+				continue // transport error: upstream may still be alive via another key
 			}
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
-			if resp.StatusCode >= 500 {
-				n := pool.HealthCheckAll(coolDur, fmt.Sprintf("upstream probe: HTTP %d", resp.StatusCode))
-				if n > 0 {
-					slog.Warn("upstream health probe got 5xx", "url", probeURL, "status", resp.StatusCode, "keys_cooled", n)
+			switch {
+			case resp.StatusCode >= 200 && resp.StatusCode < 300:
+				// Upstream answered healthy through this key. Feed the
+				// model cache with the body we already paid for.
+				if okBody == nil && len(body) > 0 {
+					okBody = body
 				}
-			} else {
-				// Upstream responded healthy. If every key was in cooldown (total
-				// outage), clear them so the gateway resumes immediately instead
-				// of waiting for each cooldown to expire individually.
-				if n := pool.ClearCooldowns(); n > 0 {
-					slog.Info("upstream probe recovered; cleared cooldowns", "url", probeURL, "keys", n)
-				}
+				roundFailed = false
+			case resp.StatusCode == 429, resp.StatusCode == 401, resp.StatusCode == 403:
+				// Upstream is alive; this is a key/quota-level signal.
+				// Never a reason to cool the whole pool.
+				roundFailed = false
+			default:
+				slog.Debug("upstream probe: key got status", "status", resp.StatusCode)
 			}
+		}
+		if !roundFailed {
+			fails = 0
+			interval = every
+			// A successful probe also proves the sampled keys work; if the
+			// whole pool was in a total-outage cooldown, clear it now.
+			if n := pool.ClearCooldowns(); n > 0 {
+				slog.Info("upstream probe recovered; cleared cooldowns", "url", probeURL, "keys", n)
+			}
+			if okBody != nil {
+				mc.Set(okBody)
+			}
+			continue
+		}
+		fails++
+		if fails < threshold {
+			slog.Warn("upstream probe round failed", "fails", fails, "threshold", threshold)
+			interval = every * time.Duration(1<<uint(fails)) // gentle backoff between failed rounds
+			if interval > 5*time.Minute {
+				interval = 5 * time.Minute
+			}
+			continue
+		}
+		// Threshold reached: upstream is down for real. Cool the pool once
+		// (HealthCheckAll never extends an existing cooldown) and back the
+		// probe off so we stop adding load to a dying upstream.
+		n := pool.HealthCheckAll(coolDur, "upstream probe: consecutive failures")
+		if n > 0 {
+			slog.Warn("upstream health probe failed; cooling keys",
+				"url", probeURL, "keys", n, "consecutive_fails", fails)
+		}
+		interval = every * time.Duration(1<<uint(fails-threshold+1))
+		if interval > 10*time.Minute {
+			interval = 10 * time.Minute
 		}
 	}
 }

@@ -963,6 +963,45 @@ func (p *Pool) Summary() (total, healthy int) {
 	return total, healthy
 }
 
+// SampleKeys returns up to n distinct eligible (healthy, RPM-OK) key values
+// chosen uniformly at random from the pool, for the background upstream
+// health probe to sample multiple keys instead of trusting one. It does not
+// take in-flight slots. Returns fewer (possibly zero) when the pool is small
+// or mostly cooling.
+func (p *Pool) SampleKeys(n int) []string {
+	if n <= 0 {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	eligible := make([]*Entry, 0, len(p.order))
+	for _, id := range p.order {
+		e := p.byID[id]
+		if e == nil || e.disabled || e.manualDisabled {
+			continue
+		}
+		if !e.healthy(now) || e.rpmExhausted(p.Settings(), now) {
+			continue
+		}
+		eligible = append(eligible, e)
+	}
+	if len(eligible) == 0 {
+		return nil
+	}
+	// partial Fisher–Yates: take a random slice of the first n positions.
+	r := p.rng
+	for i := 0; i < n && i < len(eligible); i++ {
+		j := i + r.Intn(len(eligible)-i)
+		eligible[i], eligible[j] = eligible[j], eligible[i]
+	}
+	out := make([]string, 0, min(n, len(eligible)))
+	for _, e := range eligible[:min(n, len(eligible))] {
+		out = append(out, e.Key)
+	}
+	return out
+}
+
 // ClearCooldowns resets all cooldown/breaker state for non-disabled keys, but
 // only when no key is currently healthy — so a probe success after a total
 // outage recovers the gateway immediately instead of waiting for each key's
@@ -1011,6 +1050,10 @@ func (p *Pool) ClearCooldowns() int {
 
 // HealthCheckAll cools every non-disabled key for d when the upstream is
 // unreachable, so the pool stops sending traffic until the next probe succeeds.
+// Keys already cooling are skipped: re-cooling them every probe round would
+// keep resetting their expiry (extending a 30s blip into an endless outage)
+// and spams one log line per key per round. A key already in cooldown simply
+// stays in its original cooldown window.
 // Called by the background upstream health goroutine in main.
 func (p *Pool) HealthCheckAll(d time.Duration, reason string) int {
 	p.mu.Lock()
@@ -1022,11 +1065,14 @@ func (p *Pool) HealthCheckAll(d time.Duration, reason string) int {
 		if e == nil || e.disabled || e.manualDisabled {
 			continue
 		}
+		if now.Before(e.resetAt()) {
+			continue // already cooling — never extend an existing cooldown
+		}
 		e.cool(now, CoolServer, d, reason)
 		n++
 	}
 	if n > 0 {
-		slog.Warn("upstream health check failed; cooling all keys",
+		slog.Warn("upstream health check failed; cooling keys",
 			"keys", n, "until", now.Add(d).Format(time.RFC3339), "reason", reason)
 	}
 	return n
