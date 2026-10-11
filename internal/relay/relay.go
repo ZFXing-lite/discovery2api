@@ -152,6 +152,17 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 		}
 	}
 
+	// Request normalization: rewrite dialect pieces the upstream rejects
+	// (o-series roles/fields). Runs once before the retry loop — normalized
+	// bodies don't change between attempts. Bodies that already match the
+	// upstream dialect pass through byte-for-byte (changed=false).
+	normBody, norm := normalizeBody(body)
+	if norm.Changed {
+		r.log.Info("request normalized", "kind", kind, "model", norm.Model,
+			"changes", strings.Join(norm.Notes, ","))
+		body = normBody
+	}
+
 	tried := map[string]bool{}
 	maxAttempts := cfg.MaxRetries + 1
 	if maxAttempts < 1 {
