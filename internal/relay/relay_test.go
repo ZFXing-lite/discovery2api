@@ -22,6 +22,13 @@ type mockUpstream struct {
 	failKeys map[string]int // key -> status to return
 	sawKeys  []string
 	body     string
+	// slow400: key -> how many initial calls answer with a delayed 400
+	// upstream_request_rejected before falling back to normal success.
+	// Simulates the production "slow 400" backend rejection.
+	slow400   map[string]int
+	slowBody  string        // body of the delayed 400 (defaults to upstream_request_rejected)
+	slowDelay time.Duration // artificial upstream processing time before the 400
+	calls     map[string]int
 }
 
 func (m *mockUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -30,6 +37,25 @@ func (m *mockUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		key = r.Header.Get("x-api-key")
 	}
 	m.sawKeys = append(m.sawKeys, key)
+	if n, ok := m.slow400[key]; ok {
+		if m.calls == nil {
+			m.calls = map[string]int{}
+		}
+		m.calls[key]++
+		if m.calls[key] <= n {
+			body := m.slowBody
+			if body == "" {
+				body = `{"error":{"code":"upstream_request_rejected","message":"Bad Request","type":"invalid_request_error"}}`
+			}
+			if m.slowDelay > 0 {
+				time.Sleep(m.slowDelay)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			_, _ = w.Write([]byte(body))
+			return
+		}
+	}
 	if st, ok := m.failKeys[key]; ok {
 		w.Header().Set("Content-Type", "application/json")
 		if st == 429 {
@@ -89,6 +115,7 @@ func testRelayer(t *testing.T, failKeys map[string]int) (*Relayer, *mockUpstream
 		DisableOn401: true,
 		MaxRetries:   3,
 		RetryOn:      []int{429, 500, 502, 503, 504},
+		Backoff:      time.Millisecond, // keep retry tests fast
 	}, "")
 	// Deterministic picks so rotation assertions are stable.
 	pool.SetRand(1)
@@ -291,6 +318,107 @@ func TestClientCancelStopsUpstream(t *testing.T) {
 	// Must not panic or hang; the cancelled context ends the request.
 	if w.Code == 0 {
 		t.Fatal("no response written")
+	}
+}
+
+// ---------- transient-400 rotation ----------
+
+// transientCfg rewrites the relayer config with transient-400 retry enabled
+// and a small elapsed gate so tests do not need real 10s delays.
+func transientCfg(r *Relayer, retries int) {
+	c := *r.cfg.Load()
+	c.Transient400Retries = retries
+	c.Transient400MinElapsed = 10 * time.Millisecond
+	r.Update(c)
+}
+
+// TestTransient400RotatesAndSucceeds: the first key answers with the
+// production slow-400 signature; the retry on another key succeeds and the
+// client sees a normal 200.
+func TestTransient400RotatesAndSucceeds(t *testing.T) {
+	r, mu, first := testRelayer(t, nil)
+	mu.slow400 = map[string]int{first: 1}
+	mu.slowDelay = 25 * time.Millisecond
+	transientCfg(r, 1)
+
+	w := httptest.NewRecorder()
+	r.Handle(w, newReq(t, "/v1/chat/completions",
+		`{"model":"auto","messages":[{"role":"user","content":"hi"}]}`), KindChat)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200 after one transient-400 rotation; body=%s", w.Code, w.Body.String())
+	}
+	if len(mu.sawKeys) != 2 || mu.sawKeys[0] != first || mu.sawKeys[1] == first {
+		t.Fatalf("expected exactly one rotation away from %q, saw %v", first, mu.sawKeys)
+	}
+}
+
+// TestFast400StillFastFails: a 400 that returns instantly (schema error) must
+// not be retried even with transient-400 retry enabled — the elapsed gate is
+// what separates the two classes.
+func TestFast400StillFastFails(t *testing.T) {
+	r, mu, first := testRelayer(t, nil)
+	mu.slow400 = map[string]int{first: 99}
+	mu.slowDelay = 0 // instant 400
+	transientCfg(r, 1)
+
+	w := httptest.NewRecorder()
+	r.Handle(w, newReq(t, "/v1/chat/completions",
+		`{"model":"auto","messages":[{"role":"user","content":"hi"}]}`), KindChat)
+
+	if w.Code != 400 {
+		t.Fatalf("status = %d, want 400 surfaced verbatim", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "upstream_request_rejected") {
+		t.Fatalf("expected upstream body surfaced, got %s", w.Body.String())
+	}
+	if len(mu.sawKeys) != 1 {
+		t.Fatalf("instant 400 must not rotate, saw %v", mu.sawKeys)
+	}
+}
+
+// TestSlow400OtherCodeNotRetried: a slow 400 whose body does not carry the
+// upstream_request_rejected code must keep the old fast-fail behaviour.
+func TestSlow400OtherCodeNotRetried(t *testing.T) {
+	r, mu, first := testRelayer(t, nil)
+	mu.slow400 = map[string]int{first: 99}
+	mu.slowBody = `{"error":{"code":"invalid_request_error","message":"bad model"}}`
+	mu.slowDelay = 25 * time.Millisecond
+	transientCfg(r, 1)
+
+	w := httptest.NewRecorder()
+	r.Handle(w, newReq(t, "/v1/chat/completions",
+		`{"model":"auto","messages":[{"role":"user","content":"hi"}]}`), KindChat)
+
+	if w.Code != 400 {
+		t.Fatalf("status = %d, want 400 surfaced verbatim", w.Code)
+	}
+	if len(mu.sawKeys) != 1 {
+		t.Fatalf("non-upstream_request_rejected 400 must not rotate, saw %v", mu.sawKeys)
+	}
+}
+
+// TestTransient400BudgetExhausted: when every key keeps answering with the
+// slow-400 signature, the budget (Transient400Retries=1) allows exactly one
+// rotation; the last upstream response is then surfaced verbatim.
+func TestTransient400BudgetExhausted(t *testing.T) {
+	r, mu, _ := testRelayer(t, nil)
+	mu.slow400 = map[string]int{"bad-key": 99, "good-key": 99}
+	mu.slowDelay = 25 * time.Millisecond
+	transientCfg(r, 1)
+
+	w := httptest.NewRecorder()
+	r.Handle(w, newReq(t, "/v1/chat/completions",
+		`{"model":"auto","messages":[{"role":"user","content":"hi"}]}`), KindChat)
+
+	if w.Code != 400 {
+		t.Fatalf("status = %d, want 400 after budget exhausted", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "upstream_request_rejected") {
+		t.Fatalf("expected upstream body surfaced, got %s", w.Body.String())
+	}
+	if len(mu.sawKeys) != 2 {
+		t.Fatalf("expected exactly 2 attempts (budget=1), saw %v", mu.sawKeys)
 	}
 }
 

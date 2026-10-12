@@ -82,13 +82,15 @@ func main() {
 	metricsEnabled.Store(cfg.Metrics.Enabled)
 
 	relayer := relay.New(pool, proxies, relay.Config{
-		BaseURL:        cfg.Upstream.BaseURL,
-		DefaultModel:   cfg.Upstream.DefaultModel,
-		ForceModel:     cfg.Upstream.ForceModel,
-		Timeout:        time.Duration(cfg.Upstream.Timeout),
-		ConnectTimeout: time.Duration(cfg.Upstream.ConnectTimeout),
-		MaxRetries:     cfg.RateLimit.MaxRetries,
-		Keepalive:      20 * time.Second,
+		BaseURL:                cfg.Upstream.BaseURL,
+		DefaultModel:           cfg.Upstream.DefaultModel,
+		ForceModel:             cfg.Upstream.ForceModel,
+		Timeout:                time.Duration(cfg.Upstream.Timeout),
+		ConnectTimeout:         time.Duration(cfg.Upstream.ConnectTimeout),
+		MaxRetries:             cfg.RateLimit.MaxRetries,
+		Transient400Retries:    cfg.RateLimit.Transient400Retries,
+		Transient400MinElapsed: time.Duration(cfg.RateLimit.Transient400MinElapsed),
+		Keepalive:              20 * time.Second,
 	}, func(keyID string, kind relay.Kind, model string, prompt, completion int) {
 		if metricsEnabled.Load() {
 			rec.Record(keyID, model, prompt, completion)
@@ -118,13 +120,15 @@ func main() {
 		proxies.Replace(reloaded)
 		proxyMu.Unlock()
 		relayer.Update(relay.Config{
-			BaseURL:        newCfg.Upstream.BaseURL,
-			DefaultModel:   newCfg.Upstream.DefaultModel,
-			ForceModel:     newCfg.Upstream.ForceModel,
-			Timeout:        time.Duration(newCfg.Upstream.Timeout),
-			ConnectTimeout: time.Duration(newCfg.Upstream.ConnectTimeout),
-			MaxRetries:     newCfg.RateLimit.MaxRetries,
-			Keepalive:      20 * time.Second,
+			BaseURL:                newCfg.Upstream.BaseURL,
+			DefaultModel:           newCfg.Upstream.DefaultModel,
+			ForceModel:             newCfg.Upstream.ForceModel,
+			Timeout:                time.Duration(newCfg.Upstream.Timeout),
+			ConnectTimeout:         time.Duration(newCfg.Upstream.ConnectTimeout),
+			MaxRetries:             newCfg.RateLimit.MaxRetries,
+			Transient400Retries:    newCfg.RateLimit.Transient400Retries,
+			Transient400MinElapsed: time.Duration(newCfg.RateLimit.Transient400MinElapsed),
+			Keepalive:              20 * time.Second,
 		})
 		srv.Update(newCfg)
 		metricsEnabled.Store(newCfg.Metrics.Enabled)

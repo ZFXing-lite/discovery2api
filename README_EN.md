@@ -100,6 +100,13 @@ rate-limit:
   max-retries: 3                     # cross-key retries
   retry-on: [429, 500, 502, 503, 504]
   backoff: 1s                        # exponential, +/-25% jitter
+  # "Slow 400" retry: a 400 that only arrives after transient-400-min-elapsed
+  # and carries error code "upstream_request_rejected" is an upstream backend
+  # transient (production data: the same request succeeds on another key or
+  # minutes later), unlike instant schema errors. Retried on another key up
+  # to transient-400-retries times. 0 disables (legacy behaviour).
+  transient-400-retries: 1
+  transient-400-min-elapsed: 10s
 ```
 
 ## Key pool behaviour

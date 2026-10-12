@@ -21,18 +21,18 @@ import (
 // Config is the full gateway configuration. All durations are strings accepted
 // by time.ParseDuration (e.g. "60s", "10m", "1h").
 type Config struct {
-	Host       string     `yaml:"host"`
-	Port       int        `yaml:"port"`
-	TLS        TLS        `yaml:"tls"`
+	Host       string        `yaml:"host"`
+	Port       int           `yaml:"port"`
+	TLS        TLS           `yaml:"tls"`
 	APIKeys    []APIKeyEntry `yaml:"api-keys"`
-	Upstream   Upstream   `yaml:"upstream"`
-	Account    Account    `yaml:"account"`
-	Proxy      Proxy      `yaml:"proxy"`
-	RateLimit  RateLimit  `yaml:"rate-limit"`
-	Log        Log        `yaml:"log"`
-	Metrics    Metrics    `yaml:"metrics"`
-	Management Management `yaml:"remote-management"`
-	Credits    Credits    `yaml:"credits"`
+	Upstream   Upstream      `yaml:"upstream"`
+	Account    Account       `yaml:"account"`
+	Proxy      Proxy         `yaml:"proxy"`
+	RateLimit  RateLimit     `yaml:"rate-limit"`
+	Log        Log           `yaml:"log"`
+	Metrics    Metrics       `yaml:"metrics"`
+	Management Management    `yaml:"remote-management"`
+	Credits    Credits       `yaml:"credits"`
 }
 
 // Credits configures the upstream 墨点 (ink points) credit probe.
@@ -137,6 +137,17 @@ type RateLimit struct {
 	RetryOn []int `yaml:"retry-on"`
 	// Backoff is the base sleep between retries (exponential: backoff*2^attempt).
 	Backoff Duration `yaml:"backoff"`
+	// Transient400Retries bounds cross-key retries for "slow 400" upstream
+	// rejections: a 400 that arrived after at least transient-400-min-elapsed
+	// and carries error code "upstream_request_rejected". The upstream
+	// backend accepted and processed the request, then rejected it — a
+	// transient the next key often survives. 0 disables the behaviour
+	// (all 400s fast-fail as before).
+	Transient400Retries int `yaml:"transient-400-retries"`
+	// Transient400MinElapsed is the minimum upstream response time for a 400
+	// to count as transient. Schema-level rejections return in well under a
+	// second; backend rejections take tens of seconds.
+	Transient400MinElapsed Duration `yaml:"transient-400-min-elapsed"`
 }
 
 type Log struct {
@@ -221,6 +232,11 @@ func Default() *Config {
 			MaxRetries:    3,
 			RetryOn:       []int{429, 500, 502, 503, 504},
 			Backoff:       Duration(time.Second),
+			// One retry for slow upstream_request_rejected 400s (observed
+			// 2026-10-11: 16/16 such failures succeeded on another key or
+			// minutes later). 10s separates them from instant schema errors.
+			Transient400Retries:    1,
+			Transient400MinElapsed: Duration(10 * time.Second),
 		},
 		Log: Log{Level: "info", Format: "text"},
 		Metrics: Metrics{
@@ -322,6 +338,12 @@ func (c *Config) normalize() error {
 	}
 	if c.RateLimit.Backoff < 0 {
 		c.RateLimit.Backoff = 0
+	}
+	if c.RateLimit.Transient400Retries < 0 {
+		c.RateLimit.Transient400Retries = 0
+	}
+	if c.RateLimit.Transient400Retries > 0 && c.RateLimit.Transient400MinElapsed <= 0 {
+		c.RateLimit.Transient400MinElapsed = Duration(10 * time.Second)
 	}
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
@@ -679,19 +701,19 @@ func (c *Config) SnapshotJSON() ([]byte, error) {
 		proxies = append(proxies, maskProxyURL(p.URL))
 	}
 	return json.MarshalIndent(&struct {
-		Host         string      `json:"host"`
-		Port         int         `json:"port"`
-		TLS          tlsOut      `json:"tls"`
-		Upstream     upstreamOut `json:"upstream"`
-		Account      Account     `json:"account"`
-		Proxy        proxyOut    `json:"proxy"`
-		RateLimit    rateOut     `json:"rate-limit"`
-		Log          logOut      `json:"log"`
-		Metrics      metricsOut  `json:"metrics"`
-		Management   mgmtOut     `json:"remote-management"`
-		KeysMasked   []outKey    `json:"upstream-keys-masked"`
+		Host         string         `json:"host"`
+		Port         int            `json:"port"`
+		TLS          tlsOut         `json:"tls"`
+		Upstream     upstreamOut    `json:"upstream"`
+		Account      Account        `json:"account"`
+		Proxy        proxyOut       `json:"proxy"`
+		RateLimit    rateOut        `json:"rate-limit"`
+		Log          logOut         `json:"log"`
+		Metrics      metricsOut     `json:"metrics"`
+		Management   mgmtOut        `json:"remote-management"`
+		KeysMasked   []outKey       `json:"upstream-keys-masked"`
 		APIKeys      []APIKeyMasked `json:"api-keys-masked"`
-		AuthRequired bool        `json:"auth-required"`
+		AuthRequired bool           `json:"auth-required"`
 	}{
 		Host: c.Host, Port: c.Port,
 		TLS: tlsOut{Enable: c.TLS.Enable, Cert: c.TLS.Cert, Key: maskPathKey(c.TLS.Key)},

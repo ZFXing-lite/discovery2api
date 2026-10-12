@@ -66,6 +66,14 @@ rate-limit:
   max-retries: 3            # cross-key retries per request
   retry-on: [429, 500, 502, 503, 504]
   backoff: 1s               # base retry backoff (exponential, +/-25% jitter)
+  # "Slow 400" retry: a 400 that arrives after at least transient-400-min-elapsed
+  # and carries error code "upstream_request_rejected" means the upstream
+  # backend accepted and processed the request, then rejected it — an upstream
+  # transient that another key often survives. Such 400s are retried on a
+  # different key, up to transient-400-retries times. Schema-level 400s return
+  # almost instantly and keep fast-failing. Set 0 to disable (legacy behaviour).
+  transient-400-retries: 1
+  transient-400-min-elapsed: 10s
 
 log:
   level: "info"             # debug | info | warn | error

@@ -14,12 +14,12 @@ package relay
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"context"
 	"net"
 	"net/http"
 	"strconv"
@@ -78,6 +78,14 @@ type Config struct {
 	MaxBodyBytes   int64
 	// Keepalive emits an SSE comment this often while waiting for chunks.
 	Keepalive time.Duration
+	// Transient400Retries bounds cross-key retries for "slow 400" upstream
+	// rejections (see isTransient400). 0 disables the behaviour.
+	Transient400Retries int
+	// Transient400MinElapsed is the minimum upstream response time for a 400
+	// to count as a transient backend rejection. Schema-level rejections
+	// come back in well under a second; backend rejections take tens of
+	// seconds because the request was accepted and processed first.
+	Transient400MinElapsed time.Duration
 }
 
 // UsageHook is called with token usage parsed from a successful non-streaming
@@ -172,9 +180,13 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 	var lastStatus int
 	var lastUpstreamBody []byte
 	var lastErr string
+	var lastErrLog string
+	var lastKeyID string
+	var lastUpstreamElapsed time.Duration
 	var poolErr error
 	committed := false // true once any bytes were written to the client
 	attempts := 0      // real upstream calls made (for honest logging)
+	transient400 := 0  // transient-400 retries consumed so far
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
@@ -210,9 +222,11 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 		}
 		tried[lease.Entry.ID] = true
 
-		status, upstreamBody, streamed, ferr, limits := r.forwardOnce(w, req, kind, cfg, lease, body, streaming)
+		status, upstreamBody, streamed, ferr, limits, upElapsed := r.forwardOnce(w, req, kind, cfg, lease, body, streaming)
 		attempts++
 		lastStatus = status
+		lastKeyID = lease.Entry.ID
+		lastUpstreamElapsed = upElapsed
 		if streamed {
 			committed = true
 		}
@@ -228,8 +242,10 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 		}
 		if ferr != nil {
 			lastErr = ferr.Error()
+			lastErrLog = truncate(lastErr, 2048)
 		} else if status >= 400 && upstreamBody != nil {
 			lastErr = truncate(string(upstreamBody), 200)
+			lastErrLog = truncate(string(upstreamBody), 2048)
 		}
 
 		r.pool.NoteResult(lease, o)
@@ -247,6 +263,23 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 			r.log.Info("served", "kind", kind, "key", lease.Entry.ID,
 				"status", status, "stream", streaming, "took", time.Since(start))
 			return
+		}
+
+		// A "slow 400" carrying code upstream_request_rejected means the
+		// upstream backend accepted and processed the request, then rejected
+		// it — an upstream transient, not a deterministic client error.
+		// Production data shows the same request succeeds on the next key /
+		// minutes later, so rotate within the Transient400Retries budget.
+		// Outside the budget (or disabled) the response is surfaced verbatim
+		// exactly as before.
+		if isTransient400(status, ferr, streamed, upstreamBody, upElapsed, cfg) {
+			if transient400 >= cfg.Transient400Retries {
+				break
+			}
+			transient400++
+			r.log.Info("transient 400 upstream rejection, rotating key",
+				"attempt", attempt+1, "upstream_took", upElapsed, "key", lease.Entry.ID)
+			continue
 		}
 
 		// Decide whether a rotation can help. shouldRotate already encodes
@@ -272,13 +305,15 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 		// early, so "after retries" was previously a lie for them — log
 		// the truth instead.
 		r.log.Warn("request failed", "kind", kind, "status", lastStatus,
-			"attempts", attempts, "err", lastErr)
+			"attempts", attempts, "key", lastKeyID,
+			"upstream_took", lastUpstreamElapsed, "err", lastErrLog)
 		return
 	}
 	if committed {
 		// The error was already injected into the stream (or the client went
 		// away). Nothing more can be written.
-		r.log.Warn("request failed after stream committed", "kind", kind, "status", lastStatus, "err", lastErr)
+		r.log.Warn("request failed after stream committed", "kind", kind, "status", lastStatus,
+			"key", lastKeyID, "upstream_took", lastUpstreamElapsed, "err", lastErrLog)
 		return
 	}
 	code := http.StatusBadGateway
@@ -313,7 +348,30 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 			"message": firstNonEmpty(lastErr, "upstream request failed"),
 			"type":    "discovery2api_error", "code": errCode,
 		}})
-	r.log.Warn("request failed", "kind", kind, "status", code, "err", lastErr, "took", time.Since(start))
+	r.log.Warn("request failed", "kind", kind, "status", code,
+		"key", lastKeyID, "upstream_took", lastUpstreamElapsed,
+		"err", lastErrLog, "took", time.Since(start))
+}
+
+// isTransient400 reports whether a 400 response is an upstream backend
+// rejection rather than a deterministic client error. The signature observed
+// in production (2026-10-11 incident, 16/16 failures): the upstream accepts
+// and processes the request for 13–47s, then answers 400 with error code
+// "upstream_request_rejected"; the same request succeeds on another key or
+// minutes later. Schema-level rejections (bad model name, malformed body)
+// return almost instantly and must keep fast-failing, so the elapsed gate is
+// what separates the two.
+func isTransient400(status int, ferr error, streamed bool, upstreamBody []byte, elapsed time.Duration, cfg Config) bool {
+	if status != 400 || ferr != nil || streamed {
+		return false
+	}
+	if cfg.Transient400Retries <= 0 || cfg.Transient400MinElapsed <= 0 {
+		return false
+	}
+	if elapsed < cfg.Transient400MinElapsed {
+		return false
+	}
+	return bytes.Contains(upstreamBody, []byte(`"upstream_request_rejected"`))
 }
 
 // shouldRotate reports whether switching keys is meaningful for this failure.
@@ -335,14 +393,19 @@ func (r *Relayer) shouldRotate(status int, err error, streamed bool) bool {
 // forwardOnce performs a single upstream attempt. It returns the upstream
 // status, the raw upstream body for non-streaming responses (nil when the
 // response was streamed straight to the client), whether the client response
-// was already committed, any transport error, and the parsed rate-limit
-// headers for the pool.
-func (r *Relayer) forwardOnce(w http.ResponseWriter, req *http.Request, kind Kind, cfg Config, lease keypool.Lease, body []byte, streaming bool) (status int, respBody []byte, streamed bool, ferr error, limits keypool.Limits) {
+// was already committed, any transport error, the parsed rate-limit headers
+// for the pool, and how long the upstream took to answer (full stream
+// duration for streamed bodies; error bodies are buffered before return, so
+// for 4xx/5xx it is the pure upstream processing time — the isTransient400
+// gate depends on that).
+func (r *Relayer) forwardOnce(w http.ResponseWriter, req *http.Request, kind Kind, cfg Config, lease keypool.Lease, body []byte, streaming bool) (status int, respBody []byte, streamed bool, ferr error, limits keypool.Limits, elapsed time.Duration) {
+	t0 := time.Now()
+	defer func() { elapsed = time.Since(t0) }()
 	upURL := strings.TrimRight(cfg.BaseURL, "/") + kind.UpstreamPath()
 
 	upReq, err := http.NewRequestWithContext(req.Context(), http.MethodPost, upURL, bytes.NewReader(body))
 	if err != nil {
-		return 0, nil, false, fmt.Errorf("build upstream request: %w", err), limits
+		return 0, nil, false, fmt.Errorf("build upstream request: %w", err), limits, time.Since(t0)
 	}
 	copyForwardHeaders(upReq.Header, req.Header, kind)
 	applyAuth(upReq.Header, kind, lease.Entry.Key)
@@ -353,7 +416,7 @@ func (r *Relayer) forwardOnce(w http.ResponseWriter, req *http.Request, kind Kin
 	}
 	resp, err := client.Do(upReq)
 	if err != nil {
-		return 0, nil, false, err, limits
+		return 0, nil, false, err, limits, time.Since(t0)
 	}
 	defer resp.Body.Close()
 
@@ -364,19 +427,19 @@ func (r *Relayer) forwardOnce(w http.ResponseWriter, req *http.Request, kind Kin
 	if status >= 400 || !streaming {
 		buf, err := io.ReadAll(io.LimitReader(resp.Body, cfg.MaxBodyBytes+1))
 		if err != nil {
-			return status, nil, false, err, limits
+			return status, nil, false, err, limits, time.Since(t0)
 		}
 		if streaming && status < 400 {
 			// Client asked for a stream but upstream answered with a plain
 			// (error-free) body: forward it as-is.
 			writeResponseFromUpstream(w, resp, buf)
 			r.recordUsage(kind, lease, buf)
-			return status, buf, true, nil, limits
+			return status, buf, true, nil, limits, time.Since(t0)
 		}
 		if status < 400 {
 			r.recordUsage(kind, lease, buf)
 		}
-		return status, buf, false, nil, limits
+		return status, buf, false, nil, limits, time.Since(t0)
 	}
 
 	// Streaming success: pipe the stream, peeking the first chunk before the
@@ -387,13 +450,13 @@ func (r *Relayer) forwardOnce(w http.ResponseWriter, req *http.Request, kind Kin
 	if err != nil {
 		if !commit {
 			// Nothing reached the client: the caller may still rotate.
-			return status, nil, false, err, limits
+			return status, nil, false, err, limits, time.Since(t0)
 		}
 		injectStreamError(w, err)
-		return status, nil, true, err, limits
+		return status, nil, true, err, limits, time.Since(t0)
 	}
 	if cw == nil || cw.n == 0 {
-		return status, nil, false, fmt.Errorf("upstream stream ended with no data"), limits
+		return status, nil, false, fmt.Errorf("upstream stream ended with no data"), limits, time.Since(t0)
 	}
 	if !cw.sse {
 		// The client asked for a stream but upstream answered with a buffered
@@ -402,12 +465,12 @@ func (r *Relayer) forwardOnce(w http.ResponseWriter, req *http.Request, kind Kin
 		// not write it a second time, and record usage from the whole body.
 		body := cw.whole.Bytes()
 		r.recordUsage(kind, lease, body)
-		return status, body, true, nil, limits
+		return status, body, true, nil, limits, time.Since(t0)
 	}
 	if u := findUsageInStream(cw.tail.Bytes(), kind); u.ok {
 		r.recordUsageVal(kind, lease, u)
 	}
-	return status, nil, true, nil, limits
+	return status, nil, true, nil, limits, time.Since(t0)
 }
 
 // recordUsage parses usage out of a buffered response and emits the hook.
@@ -605,6 +668,7 @@ func findUsageInStream(tail []byte, kind Kind) usage {
 	}
 	return parseUsage(kind, tail)
 }
+
 // TransportFor returns a cached RoundTripper for the given lease and config.
 // Exported so the models endpoint can reuse the same transport (with SOCKS5
 // proxy pool and per-key overrides) as regular relay requests.

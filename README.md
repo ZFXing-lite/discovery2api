@@ -195,6 +195,13 @@ rate-limit:
   max-retries: 3                     # 单请求跨 key 重试次数
   retry-on: [429, 500, 502, 503, 504]
   backoff: 1s                        # 退避基数，指数增长 ±25% 抖动
+  # "慢 400"重试：上游受理并处理了请求、耗时超过 min-elapsed 后才回 400 且
+  # 错误码为 upstream_request_rejected —— 这是上游推理后端的瞬态拒绝（实测
+  # 同一请求换 key 或稍后即成功），与秒回的 schema 错误不同。此类 400 会换
+  # key 重试至多 transient-400-retries 次；schema 级 400 仍然快速失败。
+  # 设 0 关闭（回到旧行为）。
+  transient-400-retries: 1
+  transient-400-min-elapsed: 10s
 
 remote-management:
   allow-remote: true                 # 允许远程访问面板
