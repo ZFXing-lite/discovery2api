@@ -88,6 +88,7 @@ func main() {
 		Timeout:                time.Duration(cfg.Upstream.Timeout),
 		ConnectTimeout:         time.Duration(cfg.Upstream.ConnectTimeout),
 		MaxRetries:             cfg.RateLimit.MaxRetries,
+		RateLimitRetries:       cfg.RateLimit.RateLimitRetries,
 		Transient400Retries:    cfg.RateLimit.Transient400Retries,
 		Transient400MinElapsed: time.Duration(cfg.RateLimit.Transient400MinElapsed),
 		Keepalive:              20 * time.Second,
@@ -98,6 +99,13 @@ func main() {
 	})
 
 	srv := server.New(cfg, relayer, pool, proxies, rec, cfgPath)
+	// One-time upgrade repair: builds before this one attributed transport
+	// (proxy) failures to keys, leaving hundreds of perfectly good keys in a
+	// "cooling" state for days. Their recorded reason is the giveaway, so
+	// clear exactly those and leave rate-limit/5xx cooldowns alone.
+	if n := pool.ReviveStaleLinkRests("consecutive failures"); n > 0 {
+		slog.Info("startup: cleared cooldowns wrongly attributed to keys", "keys", n)
+	}
 	// Panel edits and file reloads both rebuild the live proxy pool. The
 	// relayer holds the pool pointer, so we swap the entries in place.
 	srv.SetProxyRebuilder(func(newCfg *config.Config) {
@@ -126,6 +134,7 @@ func main() {
 			Timeout:                time.Duration(newCfg.Upstream.Timeout),
 			ConnectTimeout:         time.Duration(newCfg.Upstream.ConnectTimeout),
 			MaxRetries:             newCfg.RateLimit.MaxRetries,
+			RateLimitRetries:       newCfg.RateLimit.RateLimitRetries,
 			Transient400Retries:    newCfg.RateLimit.Transient400Retries,
 			Transient400MinElapsed: time.Duration(newCfg.RateLimit.Transient400MinElapsed),
 			Keepalive:              20 * time.Second,
@@ -147,11 +156,19 @@ func main() {
 	go pool.FlushLoop(ctx, time.Duration(cfg.Metrics.FlushEvery))
 	go watcher.Run(ctx, cfg)
 	go proxyHealth(ctx, proxies, cfg)
-	// Model cache: refresh every 60s (probe loop also feeds it for free).
-	srv.StartModelCache(60 * time.Second)
-	go upstreamHealth(ctx, pool, cfg, srv.ModelCache())
-	// Credits (墨点) probe: checks all keys every 5 minutes by default.
-	srv.StartCreditsLoop(ctx, time.Duration(cfg.Credits.CheckEvery))
+	// Model cache: warm every model-cache-every (default 15m). The probe loop
+	// also feeds it for free, so this loop only catches list changes the
+	// sampled keys missed. A 60s cadence was pure upstream load: the list
+	// changes at most a few times a day.
+	cacheEvery := time.Duration(cfg.Upstream.Health.ModelCacheEvery)
+	if cacheEvery <= 0 {
+		cacheEvery = 15 * time.Minute
+	}
+	srv.StartModelCache(cacheEvery)
+	go upstreamHealth(ctx, pool, proxies, cfg, srv.ModelCache())
+	// Credits (墨点) probe: disabled — all keys share one account, probing 800
+	// keys every 5 minutes wastes upstream RPM quota for no actionable signal.
+	// srv.StartCreditsLoop(ctx, time.Duration(cfg.Credits.CheckEvery))
 	if cfg.Metrics.Enabled {
 		go rec.FlushLoop(ctx, time.Duration(cfg.Metrics.FlushEvery))
 	}
@@ -285,7 +302,7 @@ func proxyHealth(ctx context.Context, p *proxypool.Pool, cfg *config.Config) {
 // blip. 429/401 on the probe are treated as key-level signals (the upstream
 // is answering; the sampled key or quota is the problem) and never cool the
 // whole pool. On a 2xx probe the response body feeds the model cache.
-func upstreamHealth(ctx context.Context, pool *keypool.Pool, cfg *config.Config, mc *server.ModelCache) {
+func upstreamHealth(ctx context.Context, pool *keypool.Pool, proxies *proxypool.Pool, cfg *config.Config, mc *server.ModelCache) {
 	base := strings.TrimRight(cfg.Upstream.BaseURL, "/")
 	if base == "" {
 		return
@@ -312,7 +329,16 @@ func upstreamHealth(ctx context.Context, pool *keypool.Pool, cfg *config.Config,
 	if maxBackoff <= 0 {
 		maxBackoff = 10 * time.Minute
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	// Use the SOCKS5 proxy pool for probe requests when configured, so the
+	// probe can actually reach the upstream through the egress proxy.
+	var probeTransport http.RoundTripper
+	if proxies != nil && !proxies.Empty() {
+		probeTransport = proxies.Transport("health-probe", nil)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	if probeTransport != nil {
+		client.Transport = probeTransport
+	}
 	fails := 0
 	interval := every
 	for {
@@ -323,6 +349,7 @@ func upstreamHealth(ctx context.Context, pool *keypool.Pool, cfg *config.Config,
 		}
 		keys := pool.SampleKeys(sample)
 		var okBody []byte
+		var okKeys = make([]string, 0, len(keys))
 		// A round is failed UNLESS the upstream proves alive through at
 		// least one sampled key (any 2xx/429/401/403 answer counts — those
 		// all come from a living upstream). With no eligible keys the
@@ -352,8 +379,9 @@ func upstreamHealth(ctx context.Context, pool *keypool.Pool, cfg *config.Config,
 			resp.Body.Close()
 			switch {
 			case resp.StatusCode >= 200 && resp.StatusCode < 300:
-				// Upstream answered healthy through this key. Feed the
-				// model cache with the body we already paid for.
+				// This key answered: it is proven good right now, so any
+				// earlier link-failure punishment on it is stale.
+				okKeys = append(okKeys, key)
 				if okBody == nil && len(body) > 0 {
 					okBody = body
 				}
@@ -369,10 +397,17 @@ func upstreamHealth(ctx context.Context, pool *keypool.Pool, cfg *config.Config,
 		if !roundFailed {
 			fails = 0
 			interval = every
-			// A successful probe also proves the sampled keys work; if the
-			// whole pool was in a total-outage cooldown, clear it now.
+			// Revive only the keys this round actually proved good. A global
+			// ClearCooldowns() would also un-cool keys that are legitimately
+			// rate-limited or broken, undoing real protection.
+			for _, key := range okKeys {
+				pool.NoteProbeSuccess(key)
+			}
+			// A fully-cooled pool (total outage) is unambiguous: if any key
+			// answered, nothing is cooling for a good reason. This only fires
+			// when every key is out, so it cannot mask per-key state.
 			if n := pool.ClearCooldowns(); n > 0 {
-				slog.Info("upstream probe recovered; cleared cooldowns", "url", probeURL, "keys", n)
+				slog.Info("upstream probe recovered; cleared total-outage cooldowns", "url", probeURL, "keys", n)
 			}
 			if okBody != nil {
 				mc.Set(okBody)
@@ -380,6 +415,12 @@ func upstreamHealth(ctx context.Context, pool *keypool.Pool, cfg *config.Config,
 			continue
 		}
 		fails++
+		// Even a fully failed round says nothing about individual keys: the
+		// transport path may be the only broken thing. Rest only the sampled
+		// keys, and only after they fail three rounds in a row.
+		if n := pool.ProbeRound(keys, coolDur); n > 0 {
+			slog.Warn("upstream probe: keys rested", "keys", n, "consecutive_round_fails", fails)
+		}
 		if fails < threshold {
 			slog.Warn("upstream probe round failed", "fails", fails, "threshold", threshold)
 			interval = every * time.Duration(1<<uint(fails)) // gentle backoff between failed rounds
@@ -388,9 +429,10 @@ func upstreamHealth(ctx context.Context, pool *keypool.Pool, cfg *config.Config,
 			}
 			continue
 		}
-		// Threshold reached: upstream is down for real. Cool the pool once
-		// (HealthCheckAll never extends an existing cooldown) and back the
-		// probe off so we stop adding load to a dying upstream.
+		// Threshold reached: the upstream is dark through every sampled key.
+		// Cool the pool once (HealthCheckAll never extends an existing
+		// cooldown) and back the probe off so we stop adding load to a
+		// dying upstream.
 		n := pool.HealthCheckAll(coolDur, "upstream probe: consecutive failures")
 		if n > 0 {
 			slog.Warn("upstream health probe failed; cooling keys",

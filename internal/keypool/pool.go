@@ -94,7 +94,8 @@ type Entry struct {
 	until          time.Time `json:"-"`
 	coolKind       CoolKind  `json:"-"`
 	reason         string    `json:"-"`
-	failCount      int       `json:"-"` // consecutive upstream failures
+	failCount      int       `json:"-"` // consecutive upstream failures (5xx)
+	linkFailCount  int       `json:"-"` // consecutive transport/link failures (not the key's fault)
 	breakerRetry   int       `json:"-"` // breaker half-open cycle
 	breakerUntil   time.Time `json:"-"`
 	degradeUntil   time.Time `json:"-"`
@@ -116,7 +117,15 @@ type Entry struct {
 	tpmLimit     int       `json:"-"`
 	tpmRemaining int       `json:"-"`
 	tpmResetAt   time.Time `json:"-"`
+	// clusterLimitedUntil is set when the upstream answers 429 with a
+	// cluster-wide TPM message. It is account-level, not key-level: the whole
+	// pool must pause until then, because another key cannot help.
+	clusterLimitedUntil time.Time `json:"-"`
 }
+
+// clusterRateWindow is how long the pool pauses after a cluster-wide TPM 429.
+// The upstream window is one minute; a shorter pause just re-hits the ceiling.
+const clusterRateWindow = 10 * time.Second
 
 // Pool manages all upstream keys.
 type Pool struct {
@@ -397,6 +406,12 @@ type Outcome struct {
 	// Streamed reports that bytes were already written to the client: such
 	// failures must not rotate to another key for this request.
 	Streamed bool
+	// ClusterRateLimit marks a 429 that the upstream attributes to its own
+	// cluster-wide token budget ("Cluster TPM rate limit exceeded") rather
+	// than to this key's quota. Every key shares that ceiling, so cooling the
+	// key is pointless: it would churn all 800 keys through cooldowns while
+	// the actual limit sits above all of them.
+	ClusterRateLimit bool
 }
 
 // NoteResult updates pool state after an upstream attempt.
@@ -416,15 +431,23 @@ func (p *Pool) NoteResult(l Lease, o Outcome) {
 
 	switch {
 	case o.Err != nil && o.StatusCode == 0:
-		// Transport error (connect/read timeout, proxy failure). Not the
-		// key's fault, but consecutive failures degrade it out of rotation.
+		// Transport error (connect/read timeout, proxy failure, TLS reset).
+		// This is a property of the link, not of the key: the same key almost
+		// always works on the next attempt. It is counted for observability
+		// and for a final "the whole link is broken" escalation, but it must
+		// NEVER degrade or cool a key on its own — doing so previously pushed
+		// 800 healthy keys out of rotation and produced false 503s.
 		e.errorCount++
-		e.failCount++
-		if e.failCount >= s.ErrThreshold {
-			e.degradeUntil = now.Add(s.ErrCooldown)
-			e.failCount = 0
-			slog.Warn("key degraded after consecutive transport errors",
-				"key", e.ID, "until", e.degradeUntil.Format(time.RFC3339))
+		e.linkFailCount++
+		e.failCount = 0
+		if e.linkFailCount >= s.ErrThreshold*8 {
+			// Sustained link failure across many attempts: the key is not
+			// provably bad, but it is useless to keep picking it while the
+			// path is down. Cool it once, briefly, and reset the counter.
+			e.cool(now, CoolError, s.ErrCooldown, "sustained transport failures (link, not key)")
+			e.linkFailCount = 0
+			slog.Warn("key rested after sustained transport failures",
+				"key", e.ID, "until", now.Add(s.ErrCooldown).Format(time.RFC3339))
 		}
 	case o.Err != nil:
 		// A failure after a 2xx status was received — most often a stream that
@@ -443,6 +466,16 @@ func (p *Pool) NoteResult(l Lease, o Outcome) {
 		}
 	case o.StatusCode == 429:
 		e.errorCount++
+		if o.ClusterRateLimit {
+			// The ceiling is above the whole account, not this key. Cooling the
+			// key punishes something innocent and, worse, walks all 800 keys
+			// into cooldown for a limit none of them can escape. Record it and
+			// let the relay wait out the window instead.
+			e.clusterLimitedUntil = now.Add(clusterRateWindow)
+			slog.Warn("upstream cluster TPM limit hit; not cooling keys",
+				"window", clusterRateWindow)
+			break
+		}
 		d := s.Cooldown429
 		if o.Limits.RetryAfter > 0 {
 			if o.Limits.RetryAfter > 24*time.Hour {
@@ -450,8 +483,8 @@ func (p *Pool) NoteResult(l Lease, o Outcome) {
 			}
 			d = o.Limits.RetryAfter
 		} else {
-			// Escalating cooldown ladder: [2m, 10m, 1h, 1d] then capped at 1d.
-			ladder := []time.Duration{2 * time.Minute, 10 * time.Minute, time.Hour, 24 * time.Hour}
+			// Escalating cooldown ladder: [30s, 2m, 5m, 10m] then capped at 10m.
+			ladder := []time.Duration{30 * time.Second, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute}
 			idx := e.cooldownCount
 			if idx >= len(ladder) {
 				idx = len(ladder) - 1
@@ -481,6 +514,7 @@ func (p *Pool) NoteResult(l Lease, o Outcome) {
 	default:
 		e.successCount++
 		e.failCount = 0
+		e.linkFailCount = 0
 		e.breakerRetry = 0
 		e.breakerUntil = time.Time{}
 		e.degradeUntil = time.Time{}
@@ -1074,6 +1108,125 @@ func (p *Pool) HealthCheckAll(d time.Duration, reason string) int {
 	if n > 0 {
 		slog.Warn("upstream health check failed; cooling keys",
 			"keys", n, "until", now.Add(d).Format(time.RFC3339), "reason", reason)
+	}
+	return n
+}
+
+// ClusterLimitedUntil reports when the account-wide TPM window reopens. Zero
+// means no known cluster limit. The relay waits out this window instead of
+// burning keys against a ceiling no key can escape.
+func (p *Pool) ClusterLimitedUntil() time.Time {
+	now := time.Now()
+	var best time.Time
+	p.mu.Lock()
+	for _, id := range p.order {
+		e := p.byID[id]
+		if e == nil {
+			continue
+		}
+		if e.clusterLimitedUntil.After(now) && e.clusterLimitedUntil.After(best) {
+			best = e.clusterLimitedUntil
+		}
+	}
+	p.mu.Unlock()
+	return best
+}
+
+// ProbeRound applies per-key outcomes from one probe round. Unlike
+// HealthCheckAll it never touches keys it did not sample: a bad sample must
+// not convict the whole pool. Returns the number of keys rested.
+func (p *Pool) ProbeRound(keys []string, coolDur time.Duration) int {
+	if len(keys) == 0 {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	rested := 0
+	for _, key := range keys {
+		e := p.findByKey(key)
+		if e == nil || e.disabled || e.manualDisabled {
+			continue
+		}
+		e.linkFailCount++
+		if e.linkFailCount < 3 {
+			continue
+		}
+		e.cool(now, CoolError, coolDur, "upstream probe: this key failed 3 rounds")
+		e.linkFailCount = 0
+		rested++
+	}
+	return rested
+}
+
+// NoteProbeSuccess clears the link-failure streak of a key that answered the
+// probe and revives it early when its only cooldown reason was a link problem
+// that has since healed. Returns true when the key was revived.
+func (p *Pool) NoteProbeSuccess(key string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.findByKey(key)
+	if e == nil {
+		return false
+	}
+	e.linkFailCount = 0
+	if e.disabled || e.manualDisabled {
+		return false
+	}
+	if e.coolKind != CoolError && e.coolKind != CoolNone {
+		return false // 429/5xx cooldown: the key really is rate/health limited
+	}
+	if e.until.IsZero() && e.breakerUntil.IsZero() && e.degradeUntil.IsZero() {
+		return false
+	}
+	e.until = time.Time{}
+	e.coolKind = CoolNone
+	e.reason = ""
+	e.breakerUntil = time.Time{}
+	e.degradeUntil = time.Time{}
+	e.failCount = 0
+	e.linkFailCount = 0
+	return true
+}
+
+// findByKey resolves a raw key string to its entry. Callers must hold p.mu.
+func (p *Pool) findByKey(key string) *Entry {
+	for _, id := range p.order {
+		e := p.byID[id]
+		if e != nil && e.Key == key {
+			return e
+		}
+	}
+	return nil
+}
+
+// ReviveStaleLinkRests clears cooldowns applied purely because the transport
+// path looked broken. Run once at startup so a build that mis-attributed proxy
+// failures to keys does not keep serving keys marked "cooling".
+func (p *Pool) ReviveStaleLinkRests(reasonNeedle string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, id := range p.order {
+		e := p.byID[id]
+		if e == nil || e.disabled || e.manualDisabled {
+			continue
+		}
+		if reasonNeedle != "" && !strings.Contains(e.reason, reasonNeedle) {
+			continue
+		}
+		e.until = time.Time{}
+		e.coolKind = CoolNone
+		e.reason = ""
+		e.breakerUntil = time.Time{}
+		e.degradeUntil = time.Time{}
+		e.failCount = 0
+		e.linkFailCount = 0
+		e.cooldownCount = 0
+		n++
+	}
+	if n > 0 {
+		slog.Info("revived keys wrongly cooled by transport failures", "keys", n)
 	}
 	return n
 }

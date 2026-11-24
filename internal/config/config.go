@@ -83,6 +83,10 @@ type UpstreamHealth struct {
 	SampleSize    int      `yaml:"sample-size"`
 	CoolDuration  Duration `yaml:"cool-duration"`
 	MaxBackoff    Duration `yaml:"max-backoff"`
+	// ModelCacheEvery controls how often the /v1/models cache warms itself
+	// from upstream. The model list changes at most a few times a day, so the
+	// default is minutes, not seconds. <=0 means 15m.
+	ModelCacheEvery Duration `yaml:"model-cache-every"`
 }
 
 // Upstream describes the single Intern Discovery API endpoint. The base URL is shared by
@@ -131,8 +135,15 @@ type RateLimit struct {
 	ErrCooldown Duration `yaml:"err-cooldown"`
 	// DisableOn401 permanently disables a key whose key is invalid/revoked.
 	DisableOn401 bool `yaml:"disable-on-401"`
-	// MaxRetries is the number of cross-key retries per request.
+	// MaxRetries is the number of cross-key retries per request for transport
+	// errors and 5xx responses.
 	MaxRetries int `yaml:"max-retries"`
+	// RateLimitRetries is a SEPARATE retry budget for 429. A 429 from this
+	// upstream is usually a per-cluster TPM ceiling, not a per-key quota, and
+	// the pool holds hundreds of keys: rotating a few more keys almost always
+	// lands on a key with headroom, while the shared budget (often 1) would
+	// give up on the first collision. 0 falls back to MaxRetries.
+	RateLimitRetries int `yaml:"rate-limit-retries"`
 	// RetryOn lists upstream HTTP status codes that trigger a retry.
 	RetryOn []int `yaml:"retry-on"`
 	// Backoff is the base sleep between retries (exponential: backoff*2^attempt).
@@ -542,7 +553,7 @@ func (c *Config) RemoveAPIKey(id string) bool {
 	return false
 }
 
-// APIKeysMasked returns downstream keys with their ids, names and masked values.
+// APIKeysMasked returns downstream keys with their ids, names, masked values and plain keys.
 func (c *Config) APIKeysMasked() []map[string]string {
 	out := make([]map[string]string, 0, len(c.APIKeys))
 	for _, k := range c.APIKeys {
@@ -550,9 +561,24 @@ func (c *Config) APIKeysMasked() []map[string]string {
 		if key == "" {
 			continue
 		}
-		out = append(out, map[string]string{"id": UpstreamKeyID(key), "key": mask(key), "name": k.Name})
+		out = append(out, map[string]string{"id": UpstreamKeyID(key), "key": mask(key), "name": k.Name, "plain": key})
 	}
 	return out
+}
+
+// APIKeyNameForToken returns the name of the downstream API key matching the
+// given token, or "" when no match. Used by the request log to show which
+// downstream key a request was made with.
+func (c *Config) APIKeyNameForToken(token string) string {
+	for _, k := range c.APIKeys {
+		if strings.TrimSpace(k.Key) == token {
+			if k.Name != "" {
+				return k.Name
+			}
+			return mask(k.Key)
+		}
+	}
+	return ""
 }
 
 // Save writes the config back to path atomically (tmp + rename, 0600).

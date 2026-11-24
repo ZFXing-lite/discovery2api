@@ -76,6 +76,9 @@ type Config struct {
 	ConnectTimeout time.Duration
 	MaxRetries     int
 	MaxBodyBytes   int64
+	// RateLimitRetries is a separate retry budget for 429 rotations (see
+	// config.RateLimit). 0 means "same as MaxRetries".
+	RateLimitRetries int
 	// Keepalive emits an SSE comment this often while waiting for chunks.
 	Keepalive time.Duration
 	// Transient400Retries bounds cross-key retries for "slow 400" upstream
@@ -130,6 +133,14 @@ const defaultMaxBody = 64 << 20 // 64 MiB
 // Handle serves one downstream request of the given kind.
 func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 	start := time.Now()
+	// ReqLogDetail for the request-log middleware. If the middleware already
+	// placed one in the context, reuse that pointer so the middleware can read
+	// the fields we fill in; otherwise create a fresh one for standalone use.
+	detail := GetReqLog(req.Context())
+	if detail == nil {
+		detail = &ReqLogDetail{}
+		req = req.WithContext(WithReqLog(req.Context(), detail))
+	}
 	cfg := *r.cfg.Load()
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = defaultMaxBody
@@ -154,6 +165,7 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 	}
 
 	streaming := isStream(body)
+	detail.Streaming = streaming
 	if cfg.ForceModel {
 		if patched, ok := forceModel(body, cfg.DefaultModel); ok {
 			body = patched
@@ -170,11 +182,19 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 			"changes", strings.Join(norm.Notes, ","))
 		body = normBody
 	}
+	detail.Model = norm.Model
 
 	tried := map[string]bool{}
 	maxAttempts := cfg.MaxRetries + 1
 	if maxAttempts < 1 {
 		maxAttempts = 1
+	}
+	rateBudget := cfg.RateLimitRetries
+	if rateBudget <= 0 {
+		rateBudget = cfg.MaxRetries
+	}
+	if rateBudget < 0 {
+		rateBudget = 0
 	}
 
 	var lastStatus int
@@ -187,6 +207,23 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 	committed := false // true once any bytes were written to the client
 	attempts := 0      // real upstream calls made (for honest logging)
 	transient400 := 0  // transient-400 retries consumed so far
+	modelRetries := 0  // retired-model rewrites consumed so far (max 1)
+	rateUsed := 0      // 429 rotations charged to the rate budget
+	clusterWaits := 0  // cluster-TPM window waits for this request
+	// A cluster TPM window is ~1 minute. Waiting twice for 15s keeps a client
+	// request alive across one window without hanging forever.
+	const maxClusterWaits = 2
+	const maxClusterWait = 15 * time.Second
+
+	// Fill the request-log detail with final values when Handle returns.
+	defer func() {
+		detail.KeyID = lastKeyID
+		detail.UpstreamStatus = lastStatus
+		detail.Retries = attempts - 1
+		if detail.Retries < 0 {
+			detail.Retries = 0
+		}
+	}()
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
@@ -232,10 +269,11 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 		}
 
 		o := keypool.Outcome{
-			StatusCode: status,
-			Err:        ferr,
-			Streamed:   streamed,
-			Limits:     limits,
+			StatusCode:       status,
+			Err:              ferr,
+			Streamed:         streamed,
+			Limits:           limits,
+			ClusterRateLimit: isClusterRateLimit(status, upstreamBody),
 		}
 		if upstreamBody != nil {
 			lastUpstreamBody = upstreamBody
@@ -288,8 +326,68 @@ func (r *Relayer) Handle(w http.ResponseWriter, req *http.Request, kind Kind) {
 		// name, malformed body) that another key cannot fix, so we break
 		// and surface the upstream response verbatim — no wasted retries,
 		// no artificial client wait (fast-fail).
+		//
+		// One 4xx IS fixable without the client: the upstream retired the
+		// requested model and told us its replacement. Rewriting the body
+		// and retrying keeps old client configs working instead of 404ing
+		// until someone edits them by hand.
+		if status == 404 && ferr == nil && !streamed {
+			if hint := disabledModelHint(upstreamBody); hint != "" {
+				if patched, ok := rewriteModel(body, hint); ok {
+					if modelRetries < 1 {
+						modelRetries++
+						body = patched
+						detail.Model = hint
+						tried = map[string]bool{}
+						attempt--
+						attempts--
+						r.log.Info("upstream retired the model, retrying with its replacement",
+							"kind", kind, "suggested", hint)
+						continue
+					}
+				}
+			}
+		}
+
 		if !r.shouldRotate(status, ferr, streamed) {
 			break
+		}
+		// 429 rotation is charged to its own budget, not the shared attempt
+		// counter: a cluster-wide TPM ceiling is exactly the case where one
+		// more key usually succeeds, so it must not be capped at max-retries=1.
+		if status == 429 && ferr == nil && !streamed {
+			// A cluster-wide TPM 429 is account-level: every key shares the
+			// same ceiling, so rotating just walks the pool into cooldowns.
+			// Wait out the window on the same request instead.
+			if o.ClusterRateLimit {
+				if clusterWaits >= maxClusterWaits {
+					break // window will not clear within this request's patience
+				}
+				clusterWaits++
+				wait := time.Until(r.pool.ClusterLimitedUntil())
+				if wait <= 0 {
+					wait = 2 * time.Second
+				}
+				if wait > maxClusterWait {
+					wait = maxClusterWait
+				}
+				r.log.Info("cluster TPM ceiling hit, waiting for the window",
+					"kind", kind, "wait", wait, "waits", clusterWaits)
+				attempt-- // the wait is not a key attempt
+				select {
+				case <-req.Context().Done():
+					return
+				case <-time.After(wait):
+				}
+				continue
+			}
+			if rateUsed >= rateBudget {
+				break
+			}
+			rateUsed++
+			attempt--
+			r.log.Info("429 from upstream, rotating to another key",
+				"kind", kind, "attempt", rateUsed, "budget", rateBudget)
 		}
 	}
 
@@ -372,6 +470,21 @@ func isTransient400(status int, ferr error, streamed bool, upstreamBody []byte, 
 		return false
 	}
 	return bytes.Contains(upstreamBody, []byte(`"upstream_request_rejected"`))
+}
+
+// isClusterRateLimit reports whether a 429 body blames the upstream's own
+// cluster-wide token budget rather than this key's quota. The upstream says:
+//
+//	{"error":{"code":"upstream_request_rejected",
+//	          "message":"Cluster TPM rate limit exceeded."}}
+//
+// Rotating keys cannot help; only waiting can.
+func isClusterRateLimit(status int, upstreamBody []byte) bool {
+	if status != 429 {
+		return false
+	}
+	return bytes.Contains(upstreamBody, []byte("Cluster TPM")) ||
+		bytes.Contains(upstreamBody, []byte("cluster rate limit"))
 }
 
 // shouldRotate reports whether switching keys is meaningful for this failure.
@@ -899,6 +1012,32 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// --- request log detail (context-based) -----------------------------------
+
+// ReqLogDetail carries per-request relay details back to the middleware so the
+// request log can record model, key, upstream status, etc. The relay package
+// owns this type because importing server would be circular.
+type ReqLogDetail struct {
+	Model          string
+	KeyID          string
+	UpstreamStatus int
+	Retries        int
+	Streaming      bool
+}
+
+type reqLogCtxKey struct{}
+
+// WithReqLog stores a *ReqLogDetail in the context.
+func WithReqLog(ctx context.Context, d *ReqLogDetail) context.Context {
+	return context.WithValue(ctx, reqLogCtxKey{}, d)
+}
+
+// GetReqLog retrieves the *ReqLogDetail from the context, or nil when absent.
+func GetReqLog(ctx context.Context) *ReqLogDetail {
+	v, _ := ctx.Value(reqLogCtxKey{}).(*ReqLogDetail)
+	return v
 }
 
 // withConnectTimeout bounds connection setup (dial + TLS handshake) so a dead

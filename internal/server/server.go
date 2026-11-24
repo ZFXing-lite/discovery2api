@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,7 @@ type Server struct {
 	proxies *proxypool.Pool
 	metrics *metrics.Recorder
 	stats   *Stats
+	reqLog  *ReqLogger
 	mgmtOn  atomic.Bool
 	// mgmtMu serializes read-modify-write of the live config so concurrent
 	// management requests cannot drop each other's updates.
@@ -61,7 +63,7 @@ type Server struct {
 func New(cfg *config.Config, relayer *relay.Relayer, pool *keypool.Pool,
 	proxies *proxypool.Pool, rec *metrics.Recorder, configPath string) *Server {
 	s := &Server{relayer: relayer, pool: pool, proxies: proxies, metrics: rec,
-		stats: NewStats(), configPath: configPath,
+		stats: NewStats(), reqLog: NewReqLogger(1000), configPath: configPath,
 		log: slog.With("component", "server"), started: time.Now()}
 	s.cfg.Store(cfg)
 	s.mgmtOn.Store(true)
@@ -71,7 +73,14 @@ func New(cfg *config.Config, relayer *relay.Relayer, pool *keypool.Pool,
 		timeout = 10 * time.Second
 	}
 	s.credits = credits.New(cfg.Upstream.BaseURL, timeout)
-	s.mc = NewModelCache()
+	// Persist the model list next to the metrics state so a restart with an
+	// unreachable upstream still serves the real catalog instead of the
+	// static fallback (which goes stale as upstream retires models).
+	stateDir := "state"
+	if cfg.Metrics.StateFile != "" {
+		stateDir = filepath.Dir(cfg.Metrics.StateFile)
+	}
+	s.mc = NewModelCacheWithPath(filepath.Join(stateDir, "models.json"))
 	// Attach a fetch that reuses the relayer transport so SOCKS5 proxy pool
 	// and per-key proxy overrides apply to model-list fetches too.
 	if relayer != nil {
@@ -197,18 +206,24 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	s.serveStaticModels(w, r, cfg)
 }
 
-// knownDiscoveryModels is the fallback catalog used when the upstream is
-// unreachable or no keys are configured. These are the models documented on
-// the Intern Discovery platform.
+// knownDiscoveryModels is the last-resort catalog used only when the cache has
+// never been warmed (first boot, no disk state) AND the upstream is
+// unreachable. It must track what the upstream actually serves: a stale list
+// here makes every client request 404 with "model disabled", which looks like
+// an outage. Refreshed 2026-11-24 against /v1/models.
 var knownDiscoveryModels = []map[string]any{
+	{"id": "deepseek-v4.1-flash-1017", "object": "model", "owned_by": "tokenplan", "context_length": 256000},
+	{"id": "glm-5.3", "object": "model", "owned_by": "tokenplan", "context_length": 200000},
+	{"id": "kimi-k3.1-pro", "object": "model", "owned_by": "tokenplan", "context_length": 256000},
+	{"id": "intern-s2", "object": "model", "owned_by": "tokenplan", "context_length": 128000},
+	{"id": "qwen3.8-27b", "object": "model", "owned_by": "tokenplan", "context_length": 131072},
+	{"id": "Sage-A1.5", "object": "model", "owned_by": "tokenplan", "context_length": 128000},
+	{"id": "Sage-A1.5-Taiyi", "object": "model", "owned_by": "tokenplan", "context_length": 128000},
+	{"id": "Sage-S2.1-Flash", "object": "model", "owned_by": "tokenplan", "context_length": 128000},
+	{"id": "Atria-Dawn", "object": "model", "owned_by": "tokenplan", "context_length": 128000},
+	{"id": "Atria-Dawn-Preview", "object": "model", "owned_by": "tokenplan", "context_length": 128000},
+	{"id": "Agents-A1", "object": "model", "owned_by": "tokenplan", "context_length": 128000},
 	{"id": "auto", "object": "model", "owned_by": "discovery", "context_length": 256000},
-	{"id": "deepseek-v3", "object": "model", "owned_by": "discovery", "context_length": 64000},
-	{"id": "deepseek-r1", "object": "model", "owned_by": "discovery", "context_length": 64000},
-	{"id": "glm-4", "object": "model", "owned_by": "discovery", "context_length": 128000},
-	{"id": "glm-4-flash", "object": "model", "owned_by": "discovery", "context_length": 128000},
-	{"id": "qwen-plus", "object": "model", "owned_by": "discovery", "context_length": 131072},
-	{"id": "qwen-turbo", "object": "model", "owned_by": "discovery", "context_length": 8192},
-	{"id": "kimi-k1.5", "object": "model", "owned_by": "discovery", "context_length": 128000},
 }
 
 // serveStaticModels returns a static model catalog. Anthropic clients get the
@@ -342,6 +357,18 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 			s.stats.Begin(r.URL.Path)
 		}
 		rw := &statusWriter{ResponseWriter: w, status: 200}
+		// Create a ReqLogDetail for the relay to fill in via context. The
+		// pointer is shared, so after next.ServeHTTP returns the fields the
+		// relay set are visible here without re-reading the context.
+		detail := &relay.ReqLogDetail{}
+		r = r.WithContext(relay.WithReqLog(r.Context(), detail))
+		// Capture the downstream API key name for the request log.
+		downstreamKeyName := ""
+		if token := extractToken(r); token != "" {
+			if name := s.cfg.Load().APIKeyNameForToken(token); name != "" {
+				downstreamKeyName = name
+			}
+		}
 		// next recovers panics itself, but if it ever does not the deferred End
 		// keeps the inflight counter from leaking forever.
 		defer func() {
@@ -351,6 +378,27 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 			}
 			if track {
 				s.stats.End(r.URL.Path, rw.status, time.Since(start), errMsg)
+				reqBytes := int(r.ContentLength)
+				if reqBytes < 0 {
+					reqBytes = 0
+				}
+				s.reqLog.Add(ReqLogEntry{
+					Time:           start,
+					Method:         r.Method,
+					Path:           r.URL.Path,
+					ClientIP:       clientIP(r),
+					Status:         rw.status,
+					Duration:       time.Since(start).Round(time.Millisecond).String(),
+					ReqBytes:       reqBytes,
+					RespBytes:      rw.bytes,
+					Model:          detail.Model,
+					KeyID:          detail.KeyID,
+					DownstreamKey:  downstreamKeyName,
+					UpstreamStatus: detail.UpstreamStatus,
+					Error:          errMsg,
+					Streaming:      detail.Streaming,
+					Retries:        detail.Retries,
+				})
 			}
 		}()
 		next.ServeHTTP(rw, r)

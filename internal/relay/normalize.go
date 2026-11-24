@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 )
@@ -106,4 +107,51 @@ func normalizeBody(body []byte) ([]byte, normalizeResult) {
 	}
 	res.Changed = true
 	return out, res
+}
+
+// disabledModelHint extracts the replacement model from an upstream
+// "model_disabled" error body. The upstream returns:
+//
+//	{"error":{"code":"model_disabled","message":"Model 'X' was disabled ...",
+//	          "suggested_model":"Y"}}
+//
+// Returning "" means the body is not a retirement notice.
+func disabledModelHint(upstreamBody []byte) string {
+	if len(upstreamBody) == 0 || !bytes.Contains(upstreamBody, []byte(`"model_disabled"`)) {
+		return ""
+	}
+	var env struct {
+		Error struct {
+			Code           string `json:"code"`
+			SuggestedModel string `json:"suggested_model"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(upstreamBody, &env); err != nil {
+		return ""
+	}
+	if env.Error.Code != "model_disabled" {
+		return ""
+	}
+	return strings.TrimSpace(env.Error.SuggestedModel)
+}
+
+// rewriteModel replaces the body's model field with dst. It reports false when
+// the body carries no model field or cannot be parsed.
+func rewriteModel(body []byte, dst string) ([]byte, bool) {
+	if dst == "" {
+		return body, false
+	}
+	var probe map[string]any
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return body, false
+	}
+	if _, ok := probe["model"]; !ok {
+		return body, false
+	}
+	probe["model"] = dst
+	out, err := json.Marshal(probe)
+	if err != nil {
+		return body, false
+	}
+	return out, true
 }

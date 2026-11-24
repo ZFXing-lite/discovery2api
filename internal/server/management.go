@@ -90,7 +90,7 @@ func (s *Server) management(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case p == "/endpoints":
 		writeJSON(w, http.StatusOK, map[string]any{"endpoints": []string{
-			"/config", "/keys", "/keys/bulk", "/keys/batch", "/api-keys", "/usage", "/stats", "/credits", "/proxies", "/settings", "/panel",
+			"/config", "/keys", "/keys/bulk", "/keys/batch", "/api-keys", "/usage", "/stats", "/credits", "/proxies", "/settings", "/reqlog", "/panel",
 		}})
 	case p == "/config":
 		b, err := cfg.SnapshotJSON()
@@ -162,6 +162,9 @@ func (s *Server) management(w http.ResponseWriter, r *http.Request) {
 	case p == "/stats":
 		s.statsHandler(w, r)
 
+	case p == "/reqlog":
+		writeJSON(w, http.StatusOK, s.reqLog.Recent(200))
+
 	case p == "/credits" && r.Method == http.MethodGet:
 		s.creditsHandler(w, r)
 	case p == "/credits" && r.Method == http.MethodPost:
@@ -197,7 +200,7 @@ func isKnownManagementPath(p string) bool {
 		return strings.HasSuffix(p, "/disable") || strings.HasSuffix(p, "/enable")
 	case strings.HasPrefix(p, "/api-keys/"):
 		return true
-	case p == "/proxies", p == "/settings", p == "/keys", p == "/keys/bulk", p == "/keys/batch", p == "/api-keys", p == "/credits":
+	case p == "/proxies", p == "/settings", p == "/keys", p == "/keys/bulk", p == "/keys/batch", p == "/api-keys", p == "/credits", p == "/reqlog":
 		return true
 	}
 	return false

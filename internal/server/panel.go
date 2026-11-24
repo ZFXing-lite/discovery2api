@@ -443,8 +443,8 @@ var panelHTML = `<!DOCTYPE html>
     <div class="nav-item" data-target="upstream-keys" onclick="navTo('upstream-keys')">
       <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="8" cy="15" r="4"/><path d="M10.85 12.15L19 4"/><path d="M18 6l2 2"/><path d="M15 4l2 2"/></svg></span> 账号管理
     </div>
-    <div class="nav-item" data-target="stats-credits" onclick="navTo('stats-credits')">
-      <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 4-6"/></svg></span> 统计
+    <div class="nav-item" data-target="token-usage" onclick="navTo('token-usage')">
+      <span class="nav-icon">📊</span> 统计
     </div>
     <div class="nav-item" data-target="downstream-keys" onclick="navTo('downstream-keys')">
       <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-2 2l-2 2m-2 2l-2 2"/><path d="M3 11l6 6"/><path d="M14 4l6 6-3 3-6-6z"/><path d="M3 21l4-1 9-9-3-3-9 9z"/></svg></span> APIKey
@@ -454,6 +454,9 @@ var panelHTML = `<!DOCTYPE html>
     </div>
     <div class="nav-item" data-target="proxies" onclick="navTo('proxies')">
       <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg></span> SOCKS5 代理
+    </div>
+    <div class="nav-item" data-target="reqlog" onclick="navTo('reqlog')">
+      <span class="nav-icon">📋</span> 请求日志
     </div>
   </nav>
   <div class="sidebar-footer">
@@ -532,27 +535,6 @@ var panelHTML = `<!DOCTYPE html>
         <div class="aq-formula" id="aqFormula"></div>
       </div>
     </div>
-    <div class="ov-panel" style="margin-top:10px">
-      <div class="panel-title">Token 用量</div>
-      <div class="usage-mini">
-        <div>
-          <div class="subhead" style="margin-top:0">按密钥</div>
-          <div class="treemap-zone" id="usageKeysChart"></div>
-          <div class="scroll">
-            <table class="slim"><thead><tr><th>编号</th><th>请求</th><th>输入</th><th>输出</th><th>错误</th></tr></thead>
-              <tbody id="usageKeysBody"></tbody></table>
-          </div>
-        </div>
-        <div>
-          <div class="subhead" style="margin-top:0">按模型</div>
-          <div class="treemap-zone" id="usageModelsChart"></div>
-          <div class="scroll">
-            <table class="slim"><thead><tr><th>模型</th><th>请求</th><th>输入</th><th>输出</th></tr></thead>
-              <tbody id="usageModelsBody"></tbody></table>
-          </div>
-        </div>
-      </div>
-    </div>
     <div class="ov-grid">
       <div class="ov-panel">
         <div class="panel-title">请求分布</div>
@@ -604,7 +586,7 @@ var panelHTML = `<!DOCTYPE html>
           <thead><tr>
             <th style="width:28px"></th>
             <th>编号</th><th>权重</th><th>代理</th><th>状态</th><th>原因</th><th>恢复</th>
-            <th>余量</th><th>墨点</th><th>进行中</th><th>成功/失败</th>
+            <th>余量</th><th>进行中</th><th>成功/失败</th>
             <th>请求</th><th>输入</th><th>输出</th><th>合计</th><th class="right">操作</th>
           </tr></thead>
           <tbody id="keysBody"></tbody>
@@ -641,30 +623,10 @@ var panelHTML = `<!DOCTYPE html>
     </section>
   </div>
 
-  <!-- Stats / Credits (墨点) -->
-  <div class="section" id="sec-stats-credits">
+  <!-- Token Usage -->
+  <div class="section" id="sec-token-usage">
     <section>
-      <div class="sec-head"><h2>墨点统计</h2><span class="sec-sub">上游账户余额探测</span></div>
-      <p class="hint">墨点余额由上游账户共享，所有密钥共享同一账户的墨点。1墨点 ≈ 20,000,000 tokens。检测方式：向上游发送轻量请求探测账户状态。</p>
-      <div class="hero-stats" id="creditsHeroStats">
-        <div class="hero-stat"><span class="hs-k">可用账号</span><span class="hs-v ok" id="csWithCredits">—</span></div>
-        <div class="hero-stat"><span class="hs-k">墨点耗尽</span><span class="hs-v" id="csExhausted" style="color:var(--red)">—</span></div>
-        <div class="hero-stat"><span class="hs-k">未检测</span><span class="hs-v" id="csUnchecked" style="color:var(--dim)">—</span></div>
-        <div class="hero-stat"><span class="hs-k">总账号</span><span class="hs-v" id="csTotal">—</span></div>
-      </div>
-      <div class="row" style="margin:10px 0">
-        <button class="btn primary" onclick="refreshCredits()">刷新墨点</button>
-        <span class="muted" style="font-size:11px" id="creditsRefreshLbl"></span>
-      </div>
-      <div class="scroll">
-        <table>
-          <thead><tr>
-            <th>编号</th><th>墨点状态</th><th>检测时间</th><th>状态码</th><th>错误信息</th>
-          </tr></thead>
-          <tbody id="creditsBody"></tbody>
-        </table>
-      </div>
-      <div class="sec-head" style="margin-top:20px"><h2>Token 统计</h2><span class="sec-sub">今日与累计用量</span></div>
+      <div class="sec-head"><h2>Token 统计</h2><span class="sec-sub">今日与累计用量</span></div>
       <p class="hint">统计网关转发的所有请求的 Token 用量。今日已用 = 当天 UTC 日期的累计；总已用 = 网关启动或状态文件创建以来的累计。1墨点 ≈ 20,000,000 tokens。</p>
       <div class="hero-stats" id="tokenStatsHero">
         <div class="hero-stat"><span class="hs-k">今日已用</span><span class="hs-v" id="tsTodayTokens">—</span></div>
@@ -678,6 +640,27 @@ var panelHTML = `<!DOCTYPE html>
         <div class="stat-cell"><div class="sc-k">总输入</div><div class="sc-v" id="tsTotalIn">—</div></div>
         <div class="stat-cell"><div class="sc-k">总输出</div><div class="sc-v" id="tsTotalOut">—</div></div>
       </div>
+      <div class="ov-panel" style="margin-top:20px">
+        <div class="panel-title">Token 用量</div>
+        <div class="usage-mini">
+          <div>
+            <div class="subhead" style="margin-top:0">按密钥</div>
+            <div class="treemap-zone" id="usageKeysChart"></div>
+            <div class="scroll">
+              <table class="slim"><thead><tr><th>编号</th><th>请求</th><th>输入</th><th>输出</th><th>错误</th></tr></thead>
+                <tbody id="usageKeysBody"></tbody></table>
+            </div>
+          </div>
+          <div>
+            <div class="subhead" style="margin-top:0">按模型</div>
+            <div class="treemap-zone" id="usageModelsChart"></div>
+            <div class="scroll">
+              <table class="slim"><thead><tr><th>模型</th><th>请求</th><th>输入</th><th>输出</th></tr></thead>
+                <tbody id="usageModelsBody"></tbody></table>
+            </div>
+          </div>
+        </div>
+      </div>
     </section>
   </div>
 
@@ -688,7 +671,7 @@ var panelHTML = `<!DOCTYPE html>
       <p class="hint">客户端访问这个网关时使用。和面板密码无关，删掉后对应客户端会立刻无法调用。账号自动生成，只需填写名称。</p>
       <div class="scroll">
         <table class="slim">
-          <thead><tr><th>名称</th><th>账号（已掩码）</th><th class="right">操作</th></tr></thead>
+          <thead><tr><th>名称</th><th>账号</th><th class="right">操作</th></tr></thead>
           <tbody id="apiKeysBody"></tbody>
         </table>
       </div>
@@ -794,6 +777,19 @@ var panelHTML = `<!DOCTYPE html>
           <div class="panel-title">成功 / 失败</div>
           <div class="donut-wrap" id="proxyDonut"></div>
         </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- Request Log -->
+  <div class="section" id="sec-reqlog">
+    <section>
+      <div class="sec-head"><h2>请求日志</h2><span class="sec-sub">最近 200 条 API 请求</span><span class="pill dim" id="reqlogPill"></span></div>
+      <div class="scroll" id="reqlogScroll" style="max-height:70vh">
+        <table class="slim">
+          <thead><tr><th>时间</th><th>方法</th><th>路径</th><th>模型</th><th>状态</th><th>耗时</th><th>客户端IP</th><th>下游Key</th><th>上游Key</th><th>上游</th><th>流式</th><th>重试</th><th>错误</th></tr></thead>
+          <tbody id="reqlogBody"></tbody>
+        </table>
       </div>
     </section>
   </div>
@@ -1117,6 +1113,41 @@ function resetDate() {
   refresh();
 }
 
+function renderReqLog(entries) {
+  var rows = (entries || []).map(function(e){
+    var stStyle = e.status < 300 ? 'color:var(--green)' : (e.status < 500 ? 'color:var(--amber)' : 'color:var(--red)');
+    var streamBadge = e.streaming ? '<span class="pill ok">流式</span>' : '<span class="muted">-</span>';
+    var upst = e.upstream_status ? String(e.upstream_status) : '-';
+    var err = e.error ? '<span style="color:var(--red)">' + esc(e.error) + '</span>' : '-';
+    var t = e.time ? new Date(e.time) : null;
+    var timeStr = '-';
+    if (t && !isNaN(t.getTime())) {
+      timeStr = t.toLocaleTimeString('zh-CN', {hour12:false}) + '.' + String(t.getMilliseconds()).padStart(3,'0');
+    }
+    var dsKey = e.downstream_key ? esc(e.downstream_key) : '<span class="muted">' + esc(e.key_id || '-') + '</span>';
+    var upKey = e.key_id ? '<span class="muted">' + esc(e.key_id) + '</span>' : '-';
+    return '<tr><td class="mono" style="white-space:nowrap">' + esc(timeStr) + '</td>'
+      + '<td>' + esc(e.method) + '</td>'
+      + '<td class="mono">' + esc(e.path) + '</td>'
+      + '<td class="mono">' + esc(e.model || '-') + '</td>'
+      + '<td style="' + stStyle + ';font-weight:600">' + esc(e.status) + '</td>'
+      + '<td class="num">' + esc(e.duration || '-') + '</td>'
+      + '<td class="mono">' + esc(e.client_ip || '-') + '</td>'
+      + '<td class="mono">' + dsKey + '</td>'
+      + '<td class="mono">' + upKey + '</td>'
+      + '<td class="num">' + upst + '</td>'
+      + '<td>' + streamBadge + '</td>'
+      + '<td class="num">' + esc(e.retries || 0) + '</td>'
+      + '<td class="muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + attr(e.error || '') + '">' + err + '</td></tr>';
+  }).join('');
+  var el = document.getElementById('reqlogBody');
+  if (el) el.innerHTML = rows || emptyRow(13, '还没有请求日志');
+  var pill = document.getElementById('reqlogPill');
+  if (pill) pill.textContent = (entries || []).length + ' 条';
+  var sc = document.getElementById('reqlogScroll');
+  if (sc) sc.scrollTop = 0;
+}
+
 var REFRESHING = false, SLOW_TICK = 0, _slowCache = [null, null, null];
 
 function refresh() {
@@ -1131,18 +1162,19 @@ function refresh() {
     api('/v0/management/usage').catch(function(){ return {enabled:false}; }),
     doSlow ? api('/v0/management/proxies').catch(function(){ return {proxies:[]}; }) : Promise.resolve(_slowCache[1]),
     doSlow ? api('/v0/management/settings').catch(function(){ return null; }) : Promise.resolve(_slowCache[2]),
-    api('/v0/management/credits').catch(function(){ return {keys:[],summary:{}}; })
+    Promise.resolve({keys:[],summary:{}}),
+    api('/v0/management/reqlog').catch(function(){ return []; })
   ];
   Promise.all(reqs).then(function(all){
     if (doSlow) _slowCache = [all[2], all[4], all[5]];
     updateOverview(all[0], all[3], all[5]);
-    renderKeys(all[0], all[1], all[3], all[5], all[6]);
-    renderCredits(all[6]);
+    renderKeys(all[0], all[1], all[3], all[5]);
     if (doSlow) renderAPIKeys(all[2]);
     if (doSlow) renderProxies(all[4]);
     renderUsage(all[3]);
     renderTokenStats(all[3]);
     if (doSlow) renderSettings(all[5]);
+    renderReqLog(all[7]);
     var dot = document.getElementById('healthDot');
     var cls = 'dot' + (all[0].keys_healthy > 0 ? '' : ' off');
     if (dot.className !== cls) dot.className = cls;
@@ -1159,15 +1191,11 @@ function toggleAuto() {
   AUTO = !AUTO;
   document.getElementById('autoBtn').textContent = AUTO ? '自动' : '手动';
 }
-function renderKeys(s, keys, usage, st, credits) {
+function renderKeys(s, keys, usage, st) {
   var total = s.keys_total || 0, healthy = s.keys_healthy || 0;
   var perKeyQuota = 0;
   if (st && st.account && st.account.token_quota) {
     perKeyQuota = st.account.token_quota;
-  }
-  var creditsByID = {};
-  if (credits && credits.keys) {
-    credits.keys.forEach(function(c) { creditsByID[c.id] = c; });
   }
   document.getElementById('keysPill').textContent = healthy + ' / ' + total;
   /* Chips */
@@ -1198,7 +1226,6 @@ function renderKeys(s, keys, usage, st, credits) {
       + '<td class="muted" title="' + attr(k.proxy || '') + '">' + proxyLbl + '</td>'
       + '<td>' + pill(k.state) + '</td><td class="muted">' + esc(k.reason || '—') + '</td><td>' + until + '</td>'
       + '<td class="num">' + (perKeyQuota > 0 ? fmtTokens(Math.max(perKeyQuota - keyUsed, 0)) + ' / ' + fmtTokens(perKeyQuota) : (k.rpm_limit ? (k.rpm_remaining + '/' + k.rpm_limit) : '—')) + '</td>'
-      + '<td>' + creditBadge(creditsByID[k.id]) + '</td>'
       + '<td class="num">' + esc(k.inflight) + '</td>'
       + '<td class="num">' + esc(k.success_count) + '/<span class="' + (k.error_count ? 'err' : '') + '">' + esc(k.error_count) + '</span></td>'
       + '<td class="num">' + (u.requests || 0) + '</td>'
@@ -1207,7 +1234,7 @@ function renderKeys(s, keys, usage, st, credits) {
       + '<td class="num">' + fmtTokens(keyUsed) + '</td>'
       + '<td class="right"><div class="actions">' + act + '</div></td></tr>';
   }).join('');
-  document.getElementById('keysBody').innerHTML = rows || emptyRow(16, '还没有上游账号，在下面添加');
+  document.getElementById('keysBody').innerHTML = rows || emptyRow(15, '还没有上游账号，在下面添加');
   keysSelUpdate();
 }
 
@@ -1227,51 +1254,6 @@ function keysSelUpdate() {
   if (master) master.checked = boxes.length > 0 && n === boxes.length;
 }
 
-function creditBadge(c) {
-  if (!c) return '<span class="muted">—</span>';
-  if (c.exhausted) return '<span style="color:var(--red);font-weight:600">✗</span>';
-  if (c.has_credits) return '<span style="color:var(--green);font-weight:600">✓</span>';
-  return '<span class="muted">—</span>';
-}
-
-function renderCredits(res) {
-  if (!res) return;
-  var sm = res.summary || {};
-  var el;
-  if (el = document.getElementById('csWithCredits')) el.textContent = sm.with_credits || 0;
-  if (el = document.getElementById('csExhausted')) el.textContent = sm.exhausted || 0;
-  if (el = document.getElementById('csUnchecked')) el.textContent = sm.unchecked || 0;
-  if (el = document.getElementById('csTotal')) el.textContent = sm.total || 0;
-  var rows = (res.keys || []).map(function(c) {
-    var statusLbl;
-    if (c.exhausted) statusLbl = '<span style="color:var(--red)">耗尽</span>';
-    else if (c.has_credits) statusLbl = '<span style="color:var(--green)">可用</span>';
-    else statusLbl = '<span class="muted">未检测</span>';
-    var lastCheck = c.last_check ? fmtTime(c.last_check) : '—';
-    var errInfo = c.last_error ? esc(c.last_error) : '—';
-    return '<tr><td class="mono">' + esc(c.id) + '</td>'
-      + '<td>' + statusLbl + '</td>'
-      + '<td class="muted">' + lastCheck + '</td>'
-      + '<td class="num">' + esc(c.status_code || '—') + '</td>'
-      + '<td class="muted">' + errInfo + '</td></tr>';
-  }).join('');
-  if (el = document.getElementById('creditsBody')) el.innerHTML = rows || emptyRow(5, '还没有墨点数据，点击上方刷新');
-}
-
-function refreshCredits() {
-  var lbl = document.getElementById('creditsRefreshLbl');
-  if (lbl) lbl.textContent = '检测中…';
-  api('/v0/management/credits', 'POST', {})
-    .then(function(res) {
-      renderCredits(res);
-      if (lbl) lbl.textContent = '已更新 ' + new Date().toLocaleTimeString();
-      toast('墨点检测完成');
-    })
-    .catch(function(e) {
-      if (lbl) lbl.textContent = '';
-      toast('墨点检测失败：' + e, true);
-    });
-}
 function renderTokenStats(usage) {
   var sm = (usage && usage.summary) || {};
   hs('tsTodayTokens', fmtTokens(sm.today_total_tokens || 0));
@@ -1378,19 +1360,26 @@ function importBulk() {
   }).catch(function(err){ toast('导入失败：' + err, true); });
 }
 
+var apiKeyPlain = {};
+var apiKeyShowPlain = {};
+function toggleAPIKeyPlain(id) {
+  apiKeyShowPlain[id] = !apiKeyShowPlain[id];
+  refresh();
+}
 function renderAPIKeys(res) {
   var rows = (res.keys || []).map(function(k){
-    var plain = apiKeyPlain[k.id] || '';
-    var display = plain ? esc(plain) : esc(k.key);
-    var copyBtn = plain
-      ? '<button class="btn sm copy-btn" onclick="copyText(\'' + attr(plain) + '\')" title="复制完整密钥">复制</button>'
-      : '<button class="btn sm copy-btn" onclick="copyText(\'' + attr(k.key) + '\')" title="复制">复制</button>';
+    var fullKey = k.plain || apiKeyPlain[k.id] || '';
+    var showPlain = !!apiKeyShowPlain[k.id];
+    var displayKey = (showPlain && fullKey) ? fullKey : k.key;
+    var display = esc(displayKey);
+    var toggleText = showPlain ? '掩码' : '明文';
+    var toggleBtn = fullKey ? '<button class="btn sm" onclick="toggleAPIKeyPlain(\'' + attr(k.id) + '\')">' + toggleText + '</button>' : '';
+    var copyBtn = '<button class="btn sm copy-btn" onclick="copyText(\'' + attr(displayKey) + '\')" title="复制">复制</button>';
     return '<tr><td>' + esc(k.name || '—') + '</td><td class="mono">' + display + '</td><td class="right"><div class="actions">'
-      + copyBtn + '<button class="btn sm danger" onclick="delAPIKey(\'' + attr(k.id) + '\')">删除</button></div></td></tr>';
+      + copyBtn + toggleBtn + '<button class="btn sm danger" onclick="delAPIKey(\'' + attr(k.id) + '\')">删除</button></div></td></tr>';
   }).join('');
   document.getElementById('apiKeysBody').innerHTML = rows || emptyRow(3, '还没有 APIKey');
 }
-var apiKeyPlain = {};
 function copyText(text) {
   if (navigator.clipboard) {
     navigator.clipboard.writeText(text).then(function(){ toast('已复制'); }).catch(function(){ fallbackCopy(text); });

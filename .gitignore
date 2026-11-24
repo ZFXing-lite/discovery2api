@@ -1,5 +1,10 @@
 # secrets / state — never commit
 config.yaml
+.env
+.env.*
+config.yaml.bak*
+config.yaml.bak-*
+backups/
 config.*.yaml
 !config.example.yaml
 state.json*
